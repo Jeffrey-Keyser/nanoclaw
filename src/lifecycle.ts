@@ -30,6 +30,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
+import { startMetricsServer } from './metrics-server.js';
 import { findChannel, formatOutbound } from './router.js';
 import {
   restoreRemoteControl,
@@ -161,10 +162,14 @@ export async function initApp(): Promise<void> {
     PROXY_BIND_HOST,
   );
 
+  // Start metrics dashboard endpoint
+  const metricsServer = await startMetricsServer();
+
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
     proxyServer.close();
+    metricsServer.close();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     process.exit(0);

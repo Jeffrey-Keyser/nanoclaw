@@ -17,6 +17,7 @@ import {
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
+import { logContainerMetric } from './db.js';
 import { logger } from './logger.js';
 import {
   CONTAINER_HOST_GATEWAY,
@@ -306,6 +307,32 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  const spawnedAt = new Date().toISOString();
+
+  const recordMetric = (opts: {
+    duration: number;
+    exitCode: number | null;
+    timedOut: boolean;
+    status: 'success' | 'error';
+    error?: string;
+  }) => {
+    try {
+      logContainerMetric({
+        group_folder: group.folder,
+        container_name: containerName,
+        started_at: spawnedAt,
+        startup_time_ms: Date.now() - startTime,
+        duration_ms: opts.duration,
+        exit_code: opts.exitCode,
+        timed_out: opts.timedOut,
+        status: opts.status,
+        error: opts.error,
+      });
+    } catch (err) {
+      logger.warn({ err }, 'Failed to record container metric');
+    }
+  };
+
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -460,6 +487,12 @@ export async function runContainerAgent(
             { group: group.name, containerName, duration, code },
             'Container timed out after output (idle cleanup)',
           );
+          recordMetric({
+            duration,
+            exitCode: code,
+            timedOut: true,
+            status: 'success',
+          });
           outputChain.then(() => {
             resolve({
               status: 'success',
@@ -474,6 +507,13 @@ export async function runContainerAgent(
           { group: group.name, containerName, duration, code },
           'Container timed out with no output',
         );
+        recordMetric({
+          duration,
+          exitCode: code,
+          timedOut: true,
+          status: 'error',
+          error: `Container timed out after ${configTimeout}ms`,
+        });
 
         resolve({
           status: 'error',
@@ -553,6 +593,13 @@ export async function runContainerAgent(
           },
           'Container exited with error',
         );
+        recordMetric({
+          duration,
+          exitCode: code,
+          timedOut: false,
+          status: 'error',
+          error: `Container exited with code ${code}`,
+        });
 
         resolve({
           status: 'error',
@@ -564,6 +611,12 @@ export async function runContainerAgent(
 
       // Streaming mode: wait for output chain to settle, return completion marker
       if (onOutput) {
+        recordMetric({
+          duration,
+          exitCode: code,
+          timedOut: false,
+          status: 'success',
+        });
         outputChain.then(() => {
           logger.info(
             { group: group.name, duration, newSessionId },
@@ -606,6 +659,13 @@ export async function runContainerAgent(
           },
           'Container completed',
         );
+        recordMetric({
+          duration,
+          exitCode: code,
+          timedOut: false,
+          status: output.status,
+          error: output.error,
+        });
 
         resolve(output);
       } catch (err) {
@@ -618,6 +678,13 @@ export async function runContainerAgent(
           },
           'Failed to parse container output',
         );
+        recordMetric({
+          duration,
+          exitCode: code,
+          timedOut: false,
+          status: 'error',
+          error: `Failed to parse container output`,
+        });
 
         resolve({
           status: 'error',
@@ -629,10 +696,18 @@ export async function runContainerAgent(
 
     container.on('error', (err) => {
       clearTimeout(timeout);
+      const duration = Date.now() - startTime;
       logger.error(
         { group: group.name, containerName, error: err },
         'Container spawn error',
       );
+      recordMetric({
+        duration,
+        exitCode: null,
+        timedOut: false,
+        status: 'error',
+        error: `Container spawn error: ${err.message}`,
+      });
       resolve({
         status: 'error',
         result: null,

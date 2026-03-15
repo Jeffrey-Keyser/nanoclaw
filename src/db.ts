@@ -6,6 +6,7 @@ import { ASSISTANT_NAME, DATA_DIR, STORE_DIR } from './config.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
+  ContainerMetric,
   NewMessage,
   RegisteredGroup,
   ScheduledTask,
@@ -64,6 +65,20 @@ function createSchema(database: Database.Database): void {
       FOREIGN KEY (task_id) REFERENCES scheduled_tasks(id)
     );
     CREATE INDEX IF NOT EXISTS idx_task_run_logs ON task_run_logs(task_id, run_at);
+
+    CREATE TABLE IF NOT EXISTS container_metrics (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      group_folder TEXT NOT NULL,
+      container_name TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      startup_time_ms INTEGER NOT NULL,
+      duration_ms INTEGER NOT NULL,
+      exit_code INTEGER,
+      timed_out INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL,
+      error TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_container_metrics_group ON container_metrics(group_folder, started_at);
 
     CREATE TABLE IF NOT EXISTS router_state (
       key TEXT PRIMARY KEY,
@@ -574,6 +589,142 @@ export function getTaskHealthSummary(
     failedTasks,
     avgDurationByTask,
   };
+}
+
+// --- Container metrics ---
+
+export function logContainerMetric(metric: ContainerMetric): void {
+  db.prepare(
+    `
+    INSERT INTO container_metrics (group_folder, container_name, started_at, startup_time_ms, duration_ms, exit_code, timed_out, status, error)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `,
+  ).run(
+    metric.group_folder,
+    metric.container_name,
+    metric.started_at,
+    metric.startup_time_ms,
+    metric.duration_ms,
+    metric.exit_code ?? null,
+    metric.timed_out ? 1 : 0,
+    metric.status,
+    metric.error ?? null,
+  );
+}
+
+export interface ContainerHealthSummary {
+  group_folder: string;
+  total_spawns: number;
+  avg_startup_time_ms: number;
+  avg_duration_ms: number;
+  timeout_count: number;
+  error_count: number;
+  success_count: number;
+  error_rate: number;
+}
+
+export function getContainerHealthSummary(
+  hoursBack: number = 24,
+): ContainerHealthSummary[] {
+  const since = new Date(Date.now() - hoursBack * 3600_000).toISOString();
+
+  return db
+    .prepare(
+      `
+      SELECT
+        group_folder,
+        COUNT(*) as total_spawns,
+        CAST(AVG(startup_time_ms) AS INTEGER) as avg_startup_time_ms,
+        CAST(AVG(duration_ms) AS INTEGER) as avg_duration_ms,
+        COALESCE(SUM(CASE WHEN timed_out = 1 THEN 1 ELSE 0 END), 0) as timeout_count,
+        COALESCE(SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END), 0) as error_count,
+        COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) as success_count
+      FROM container_metrics
+      WHERE started_at > ?
+      GROUP BY group_folder
+      ORDER BY total_spawns DESC
+    `,
+    )
+    .all(since)
+    .map((row: unknown) => {
+      const r = row as {
+        group_folder: string;
+        total_spawns: number;
+        avg_startup_time_ms: number;
+        avg_duration_ms: number;
+        timeout_count: number;
+        error_count: number;
+        success_count: number;
+      };
+      return {
+        ...r,
+        error_rate:
+          r.total_spawns > 0
+            ? Math.round((r.error_count / r.total_spawns) * 10000) / 10000
+            : 0,
+      };
+    });
+}
+
+export interface TaskMetricsSummary {
+  task_id: string;
+  group_folder: string;
+  prompt: string;
+  total_runs: number;
+  success_count: number;
+  failure_count: number;
+  success_rate: number;
+  avg_duration_ms: number;
+  last_run: string | null;
+  last_status: string | null;
+}
+
+export function getTaskMetricsSummary(
+  hoursBack: number = 24,
+): TaskMetricsSummary[] {
+  const since = new Date(Date.now() - hoursBack * 3600_000).toISOString();
+
+  return db
+    .prepare(
+      `
+      SELECT
+        t.id as task_id,
+        t.group_folder,
+        t.prompt,
+        COUNT(r.id) as total_runs,
+        COALESCE(SUM(CASE WHEN r.status = 'success' THEN 1 ELSE 0 END), 0) as success_count,
+        COALESCE(SUM(CASE WHEN r.status = 'error' THEN 1 ELSE 0 END), 0) as failure_count,
+        CAST(AVG(r.duration_ms) AS INTEGER) as avg_duration_ms,
+        MAX(r.run_at) as last_run,
+        (SELECT rl.status FROM task_run_logs rl WHERE rl.task_id = t.id ORDER BY rl.run_at DESC LIMIT 1) as last_status
+      FROM scheduled_tasks t
+      LEFT JOIN task_run_logs r ON r.task_id = t.id AND r.run_at > ?
+      WHERE t.status = 'active'
+      GROUP BY t.id
+      ORDER BY total_runs DESC
+    `,
+    )
+    .all(since)
+    .map((row: unknown) => {
+      const r = row as {
+        task_id: string;
+        group_folder: string;
+        prompt: string;
+        total_runs: number;
+        success_count: number;
+        failure_count: number;
+        avg_duration_ms: number;
+        last_run: string | null;
+        last_status: string | null;
+      };
+      return {
+        ...r,
+        success_rate:
+          r.total_runs > 0
+            ? Math.round((r.success_count / r.total_runs) * 10000) / 10000
+            : 0,
+      };
+    });
 }
 
 // --- Router state accessors ---

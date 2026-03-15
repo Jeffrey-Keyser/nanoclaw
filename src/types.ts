@@ -77,6 +77,18 @@ export interface TaskRunLog {
   error: string | null;
 }
 
+export interface ContainerMetric {
+  group_folder: string;
+  container_name: string;
+  started_at: string;
+  startup_time_ms: number;
+  duration_ms: number;
+  exit_code: number | null;
+  timed_out: boolean;
+  status: 'success' | 'error';
+  error?: string;
+}
+
 // --- Channel abstraction ---
 
 export interface Channel {

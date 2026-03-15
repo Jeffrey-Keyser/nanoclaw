@@ -6,10 +6,13 @@ import {
   deleteTask,
   getAllChats,
   getAllRegisteredGroups,
+  getContainerHealthSummary,
   getMessagesSince,
   getNewMessages,
   getTaskById,
   getTaskHealthSummary,
+  getTaskMetricsSummary,
+  logContainerMetric,
   logTaskRun,
   setRegisteredGroup,
   storeChatMetadata,
@@ -597,5 +600,155 @@ describe('getTaskHealthSummary', () => {
 
     const summary = getTaskHealthSummary(24, 300000);
     expect(summary.avgDurationByTask).toHaveLength(0);
+  });
+});
+
+// --- Container metrics ---
+
+describe('logContainerMetric', () => {
+  it('stores and aggregates container metrics per group', () => {
+    logContainerMetric({
+      group_folder: 'main',
+      container_name: 'nanoclaw-main-1',
+      started_at: new Date().toISOString(),
+      startup_time_ms: 1200,
+      duration_ms: 30000,
+      exit_code: 0,
+      timed_out: false,
+      status: 'success',
+    });
+    logContainerMetric({
+      group_folder: 'main',
+      container_name: 'nanoclaw-main-2',
+      started_at: new Date().toISOString(),
+      startup_time_ms: 800,
+      duration_ms: 25000,
+      exit_code: 0,
+      timed_out: false,
+      status: 'success',
+    });
+    logContainerMetric({
+      group_folder: 'main',
+      container_name: 'nanoclaw-main-3',
+      started_at: new Date().toISOString(),
+      startup_time_ms: 1000,
+      duration_ms: 60000,
+      exit_code: 1,
+      timed_out: true,
+      status: 'error',
+      error: 'Container timed out',
+    });
+
+    const summary = getContainerHealthSummary(24);
+    expect(summary).toHaveLength(1);
+    expect(summary[0].group_folder).toBe('main');
+    expect(summary[0].total_spawns).toBe(3);
+    expect(summary[0].success_count).toBe(2);
+    expect(summary[0].error_count).toBe(1);
+    expect(summary[0].timeout_count).toBe(1);
+    expect(summary[0].avg_startup_time_ms).toBe(1000);
+    expect(summary[0].error_rate).toBeCloseTo(0.3333, 3);
+  });
+
+  it('returns empty array when no metrics exist', () => {
+    const summary = getContainerHealthSummary(24);
+    expect(summary).toHaveLength(0);
+  });
+
+  it('excludes metrics outside the time window', () => {
+    const oldDate = new Date(Date.now() - 48 * 3600_000).toISOString();
+    logContainerMetric({
+      group_folder: 'main',
+      container_name: 'nanoclaw-main-old',
+      started_at: oldDate,
+      startup_time_ms: 1000,
+      duration_ms: 30000,
+      exit_code: 0,
+      timed_out: false,
+      status: 'success',
+    });
+
+    const summary = getContainerHealthSummary(24);
+    expect(summary).toHaveLength(0);
+  });
+
+  it('groups metrics by group_folder', () => {
+    logContainerMetric({
+      group_folder: 'main',
+      container_name: 'nanoclaw-main-1',
+      started_at: new Date().toISOString(),
+      startup_time_ms: 1000,
+      duration_ms: 30000,
+      exit_code: 0,
+      timed_out: false,
+      status: 'success',
+    });
+    logContainerMetric({
+      group_folder: 'family',
+      container_name: 'nanoclaw-family-1',
+      started_at: new Date().toISOString(),
+      startup_time_ms: 2000,
+      duration_ms: 45000,
+      exit_code: 0,
+      timed_out: false,
+      status: 'success',
+    });
+
+    const summary = getContainerHealthSummary(24);
+    expect(summary).toHaveLength(2);
+  });
+});
+
+// --- Task metrics summary ---
+
+describe('getTaskMetricsSummary', () => {
+  beforeEach(() => {
+    createTask({
+      id: 'metrics-task-1',
+      group_folder: 'main',
+      chat_jid: 'group@g.us',
+      prompt: 'daily report',
+      schedule_type: 'cron',
+      schedule_value: '0 9 * * *',
+      context_mode: 'isolated',
+      next_run: null,
+      status: 'active',
+      created_at: '2024-01-01T00:00:00.000Z',
+    });
+  });
+
+  it('returns task metrics with success rate', () => {
+    logTaskRun({
+      task_id: 'metrics-task-1',
+      run_at: new Date().toISOString(),
+      duration_ms: 5000,
+      status: 'success',
+      result: 'ok',
+      error: null,
+    });
+    logTaskRun({
+      task_id: 'metrics-task-1',
+      run_at: new Date().toISOString(),
+      duration_ms: 6000,
+      status: 'error',
+      result: null,
+      error: 'timeout',
+    });
+
+    const summary = getTaskMetricsSummary(24);
+    expect(summary).toHaveLength(1);
+    expect(summary[0].task_id).toBe('metrics-task-1');
+    expect(summary[0].total_runs).toBe(2);
+    expect(summary[0].success_count).toBe(1);
+    expect(summary[0].failure_count).toBe(1);
+    expect(summary[0].success_rate).toBe(0.5);
+    expect(summary[0].avg_duration_ms).toBe(5500);
+  });
+
+  it('returns zero runs for tasks with no recent activity', () => {
+    const summary = getTaskMetricsSummary(24);
+    expect(summary).toHaveLength(1);
+    expect(summary[0].total_runs).toBe(0);
+    expect(summary[0].success_rate).toBe(0);
   });
 });
