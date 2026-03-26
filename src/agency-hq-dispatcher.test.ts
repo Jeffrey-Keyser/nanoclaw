@@ -15,6 +15,7 @@ import {
   startStallDetector,
   stopAgencyHqSubsystems,
 } from './agency-hq-dispatcher.js';
+import { runScheduledTask } from './task-scheduler.js';
 import type { SchedulerDependencies } from './task-scheduler.js';
 import type { GroupQueue } from './group-queue.js';
 
@@ -287,6 +288,8 @@ describe('agency-hq-dispatcher', () => {
       expect(resultPut).toBeDefined();
 
       const body = JSON.parse(resultPut![1]!.body as string);
+      // Status must be 'done'
+      expect(body.status).toBe('done');
       // Existing keys must be preserved
       expect(body.context.assignee).toBe('alice');
       expect(body.context.priority).toBe('high');
@@ -333,9 +336,66 @@ describe('agency-hq-dispatcher', () => {
       expect(resultPut).toBeDefined();
 
       const body = JSON.parse(resultPut![1]!.body as string);
+      // Status must be 'done'
+      expect(body.status).toBe('done');
       // Should still have result even though GET failed
       expect(body.context.result).toBeDefined();
       expect(body.context.result.summary).toContain('Task completed');
+    });
+
+    it('writes status:failed when runScheduledTask throws', async () => {
+      const mockRunScheduledTask = vi.mocked(runScheduledTask);
+      mockRunScheduledTask.mockRejectedValueOnce(
+        new Error('Container crashed'),
+      );
+
+      // GET ready tasks
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({
+          data: [
+            {
+              id: 't-fail',
+              title: 'Failing Task',
+              description: 'will fail',
+              status: 'ready',
+            },
+          ],
+        }),
+      );
+      // PUT in-progress
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+      // GET persona
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({ data: { value: '# Persona' } }),
+      );
+
+      const deps = makeMockDeps();
+      const enqueueTask = deps.queue.enqueueTask as ReturnType<typeof vi.fn>;
+
+      await dispatchReadyTasks(deps);
+      expect(enqueueTask).toHaveBeenCalledTimes(1);
+
+      const callback = enqueueTask.mock.calls[0][2] as () => Promise<void>;
+
+      // PUT failure status write-back
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+
+      await callback();
+
+      // Find the PUT call for the failure write-back
+      const putCalls = fetchMock.mock.calls.filter(
+        (c: unknown[]) => (c[1] as RequestInit | undefined)?.method === 'PUT',
+      );
+      const failurePut = putCalls[putCalls.length - 1];
+      expect(failurePut).toBeDefined();
+
+      const body = JSON.parse(failurePut![1]!.body as string);
+      expect(body.status).toBe('failed');
+      expect(body.context.result.summary).toContain('Task failed');
+      expect(body.context.result.summary).toContain('Container crashed');
+
+      // Restore default mock behavior
+      mockRunScheduledTask.mockResolvedValue(null);
     });
 
     it('marks task blocked after 3 failed dispatch retries', async () => {

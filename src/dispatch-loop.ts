@@ -565,6 +565,7 @@ async function dispatchTask(
         const res = await agencyFetch(`/tasks/${task.id}`, {
           method: 'PUT',
           body: JSON.stringify({
+            status: 'done',
             context: mergedContext,
           }),
         });
@@ -585,6 +586,45 @@ async function dispatchTask(
       }
 
       // Clean up dispatch tracking (task succeeded — clear all backoff state)
+      dispatchRetryCount.delete(task.id);
+      dispatchSkipTicks.delete(task.id);
+      dispatchTime.delete(task.id);
+    } catch (err) {
+      // Write failure status back to Agency HQ
+      const errorMessage =
+        err instanceof Error ? err.message : String(err);
+      try {
+        const res = await agencyFetch(`/tasks/${task.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({
+            status: 'failed',
+            context: {
+              result: {
+                summary: `Task failed: ${errorMessage}`,
+              },
+            },
+          }),
+        });
+        if (!res.ok) {
+          const body = await res.text().catch(() => '');
+          log.error(
+            { status: res.status, body, taskId: task.id },
+            'Failed to write failure status to Agency HQ',
+          );
+        } else {
+          log.info(
+            { taskId: task.id },
+            'Failure status written back to Agency HQ',
+          );
+        }
+      } catch (putErr) {
+        log.error(
+          { err: putErr, taskId: task.id },
+          'Failed to PUT failure status to Agency HQ',
+        );
+      }
+
+      // Clean up dispatch tracking on failure too
       dispatchRetryCount.delete(task.id);
       dispatchSkipTicks.delete(task.id);
       dispatchTime.delete(task.id);
