@@ -1,7 +1,7 @@
 /**
  * Dispatch Invariants Test Harness
  *
- * Verifies five invariants of the dispatch pool / slot state machine.
+ * Verifies six invariants of the dispatch pool / slot state machine.
  * All tests run standalone — no live infrastructure (no AHQ, no containers).
  *
  * Invariants under test:
@@ -10,6 +10,7 @@
  *  3. Branch collision triggers yield-and-requeue, not deadlock
  *  4. 3 failed dispatch attempts transitions task to blocked with dispatch_blocked_until
  *  5. Startup reconciliation correctly frees orphaned acquiring-state rows
+ *  6. blocked_by dependencies gate dispatch and auto-unblock on completion
  */
 
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -47,7 +48,9 @@ import {
   dispatchRetryCount,
   dispatchSkipTicks,
   resetDispatchLoopState,
+  unblockDependents,
 } from './dispatch-loop.js';
+import { createCorrelationLogger } from './logger.js';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -493,5 +496,220 @@ describe('Invariant 5: startup reconciliation frees orphaned acquiring rows', ()
       vi.useRealTimers();
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// ===========================================================================
+// Invariant 6: blocked_by dependencies gate dispatch and auto-unblock
+//
+// Failure scenario: a task with blocked_by=[A] is dispatched while A is still
+// in-progress, causing out-of-order execution. The guard checks each dependency
+// status before dispatch and sets the task to blocked if any are incomplete.
+// When A completes, dependent tasks are automatically set back to ready.
+// ===========================================================================
+describe('Invariant 6: blocked_by dependency enforcement', () => {
+  it('skips dispatch and sets status=blocked when a dependency is in-progress', async () => {
+    const mockFetch = vi.mocked(agencyFetch);
+    const capturedPuts: Array<{ path: string; body: Record<string, unknown> }> = [];
+
+    mockFetch.mockImplementation(async (path: string, opts?: RequestInit) => {
+      if (path === '/tasks?status=ready') {
+        return mockResponse({
+          success: true,
+          data: [
+            makeAhqTask({ id: 'task-B' }),
+          ].map((t) => ({ ...t, blocked_by: ['task-A'] })),
+        });
+      }
+      // Dependency check: task-A is in-progress
+      if (path === '/tasks/task-A') {
+        return mockResponse({
+          success: true,
+          data: { id: 'task-A', status: 'in-progress' },
+        });
+      }
+      if (opts?.method === 'PUT') {
+        const body = JSON.parse(opts.body as string) as Record<string, unknown>;
+        capturedPuts.push({ path, body });
+      }
+      return mockResponse({ success: true });
+    });
+
+    await dispatchReadyTasks(makeMockDeps(), () => false);
+
+    // Task B should have been set to blocked
+    const blockedPut = capturedPuts.find(
+      (p) => p.path === '/tasks/task-B' && p.body.status === 'blocked',
+    );
+    expect(blockedPut, 'task-B should be set to blocked').toBeDefined();
+
+    // Task B should NOT have been set to in-progress (dispatch skipped)
+    const inProgressPut = capturedPuts.find(
+      (p) => p.path === '/tasks/task-B' && p.body.status === 'in-progress',
+    );
+    expect(inProgressPut, 'task-B should not be dispatched').toBeUndefined();
+  });
+
+  it('dispatches normally when blocked_by is empty', async () => {
+    const mockFetch = vi.mocked(agencyFetch);
+    const deps = makeMockDeps();
+
+    mockFetch.mockImplementation(async (path: string, opts?: RequestInit) => {
+      if (path === '/tasks?status=ready') {
+        return mockResponse({
+          success: true,
+          data: [makeAhqTask({ id: 'task-no-deps' })],
+        });
+      }
+      return mockResponse({ success: true });
+    });
+
+    await dispatchReadyTasks(deps, () => false);
+
+    // Should have been dispatched (enqueueTask called)
+    expect(deps.queue.enqueueTask).toHaveBeenCalled();
+  });
+
+  it('dispatches normally when all dependencies are done', async () => {
+    const mockFetch = vi.mocked(agencyFetch);
+    const deps = makeMockDeps();
+
+    mockFetch.mockImplementation(async (path: string, opts?: RequestInit) => {
+      if (path === '/tasks?status=ready') {
+        return mockResponse({
+          success: true,
+          data: [
+            { ...makeAhqTask({ id: 'task-C' }), blocked_by: ['task-A'] },
+          ],
+        });
+      }
+      // Dependency is done
+      if (path === '/tasks/task-A') {
+        return mockResponse({
+          success: true,
+          data: { id: 'task-A', status: 'done' },
+        });
+      }
+      return mockResponse({ success: true });
+    });
+
+    await dispatchReadyTasks(deps, () => false);
+
+    // Should have been dispatched
+    expect(deps.queue.enqueueTask).toHaveBeenCalled();
+  });
+
+  it('unblocks task when dependency transitions to done', async () => {
+    const mockFetch = vi.mocked(agencyFetch);
+    const capturedPuts: Array<{ path: string; body: Record<string, unknown> }> = [];
+
+    mockFetch.mockImplementation(async (path: string, opts?: RequestInit) => {
+      // Query for blocked tasks
+      if (path === '/tasks?status=blocked') {
+        return mockResponse({
+          success: true,
+          data: [
+            {
+              id: 'task-B',
+              title: 'Task B',
+              status: 'blocked',
+              blocked_by: ['task-A'],
+            },
+          ],
+        });
+      }
+      if (opts?.method === 'PUT') {
+        const body = JSON.parse(opts.body as string) as Record<string, unknown>;
+        capturedPuts.push({ path, body });
+      }
+      return mockResponse({ success: true });
+    });
+
+    const log = createCorrelationLogger(undefined, { op: 'test' });
+    await unblockDependents('task-A', log);
+
+    // Task B should have been set to ready
+    const readyPut = capturedPuts.find(
+      (p) => p.path === '/tasks/task-B' && p.body.status === 'ready',
+    );
+    expect(readyPut, 'task-B should be set to ready after task-A completes').toBeDefined();
+  });
+
+  it('unblocks task when dependency transitions to cancelled', async () => {
+    const mockFetch = vi.mocked(agencyFetch);
+    const capturedPuts: Array<{ path: string; body: Record<string, unknown> }> = [];
+
+    mockFetch.mockImplementation(async (path: string, opts?: RequestInit) => {
+      if (path === '/tasks?status=blocked') {
+        return mockResponse({
+          success: true,
+          data: [
+            {
+              id: 'task-B',
+              title: 'Task B',
+              status: 'blocked',
+              blocked_by: ['task-A'],
+            },
+          ],
+        });
+      }
+      if (opts?.method === 'PUT') {
+        const body = JSON.parse(opts.body as string) as Record<string, unknown>;
+        capturedPuts.push({ path, body });
+      }
+      return mockResponse({ success: true });
+    });
+
+    const log = createCorrelationLogger(undefined, { op: 'test' });
+    // The function doesn't check what status the completed task is in —
+    // it's called after the transition, so the task is already done/cancelled
+    await unblockDependents('task-A', log);
+
+    const readyPut = capturedPuts.find(
+      (p) => p.path === '/tasks/task-B' && p.body.status === 'ready',
+    );
+    expect(readyPut, 'task-B should be set to ready after task-A is cancelled').toBeDefined();
+  });
+
+  it('does not unblock when other dependencies are still incomplete', async () => {
+    const mockFetch = vi.mocked(agencyFetch);
+    const capturedPuts: Array<{ path: string; body: Record<string, unknown> }> = [];
+
+    mockFetch.mockImplementation(async (path: string, opts?: RequestInit) => {
+      if (path === '/tasks?status=blocked') {
+        return mockResponse({
+          success: true,
+          data: [
+            {
+              id: 'task-C',
+              title: 'Task C',
+              status: 'blocked',
+              blocked_by: ['task-A', 'task-B'],
+            },
+          ],
+        });
+      }
+      // task-B is still in-progress
+      if (path === '/tasks/task-B') {
+        return mockResponse({
+          success: true,
+          data: { id: 'task-B', status: 'in-progress' },
+        });
+      }
+      if (opts?.method === 'PUT') {
+        const body = JSON.parse(opts.body as string) as Record<string, unknown>;
+        capturedPuts.push({ path, body });
+      }
+      return mockResponse({ success: true });
+    });
+
+    const log = createCorrelationLogger(undefined, { op: 'test' });
+    await unblockDependents('task-A', log);
+
+    // Task C should NOT be set to ready (task-B still incomplete)
+    const readyPut = capturedPuts.find(
+      (p) => p.path === '/tasks/task-C' && p.body.status === 'ready',
+    );
+    expect(readyPut, 'task-C should remain blocked while task-B is incomplete').toBeUndefined();
   });
 });

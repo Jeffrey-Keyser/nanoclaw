@@ -17,6 +17,8 @@ export interface AgencyHqTask {
   dispatch_attempts?: number;
   dispatched_at?: string;
   updated_at?: string;
+  /** UUIDs of tasks that must be done/cancelled before this task can dispatch. */
+  blocked_by?: string[];
 }
 
 export interface AgencyHqSprint {
