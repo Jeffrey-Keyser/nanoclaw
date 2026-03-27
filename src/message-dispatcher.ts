@@ -21,6 +21,7 @@ import {
 } from './db/index.js';
 import { findChannel, formatMessages } from './router.js';
 import { isTriggerAllowed, loadSenderAllowlist } from './sender-allowlist.js';
+import { extractSessionCommand, handleSessionCommand, isSessionCommandAllowed } from './session-commands.js';
 import { RegisteredGroup } from './types.js';
 import {
   createCorrelationLogger,
@@ -61,6 +62,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   );
 
   if (missedMessages.length === 0) return true;
+
+  // --- Session command interception (before trigger check) ---
+  const cmdResult = await handleSessionCommand({
+    missedMessages,
+    isMainGroup,
+    groupName: group.name,
+    triggerPattern: TRIGGER_PATTERN,
+    timezone: TIMEZONE,
+    deps: {
+      sendMessage: (text) => channel.sendMessage(chatJid, text),
+      setTyping: (typing) => channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      runAgent: (prompt, onOutput) => runAgent(group, prompt, chatJid, onOutput),
+      closeStdin: () => queue.closeStdin(chatJid),
+      advanceCursor: (ts) => { state.lastAgentTimestamp[chatJid] = ts; saveState(); },
+      formatMessages,
+      canSenderInteract: (msg) => {
+        const hasTrigger = TRIGGER_PATTERN.test(msg.content.trim());
+        const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
+        return isMainGroup || !reqTrigger || (hasTrigger && (
+          msg.is_from_me ||
+          isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())
+        ));
+      },
+      deleteSession,
+      deleteInMemorySession: (groupFolder) => { delete state.sessions[groupFolder]; },
+      groupFolder: group.folder,
+    },
+  });
+  if (cmdResult.handled) return cmdResult.success;
+  // --- End session command interception ---
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -340,6 +371,22 @@ export async function startMessageLoop(): Promise<void> {
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
             if (!hasTrigger) continue;
+          }
+
+          // If any message is a session command, don't pipe — close the
+          // active container and let processGroupMessages handle it.
+          const hasSessionCmd = groupMessages.some(
+            (m) => extractSessionCommand(m.content, TRIGGER_PATTERN) !== null,
+          );
+          if (hasSessionCmd) {
+            const loopCmdMsg = groupMessages.find(
+              (m) => extractSessionCommand(m.content, TRIGGER_PATTERN) !== null,
+            )!;
+            if (isSessionCommandAllowed(isMainGroup, loopCmdMsg.is_from_me === true)) {
+              queue.closeStdin(chatJid);
+            }
+            queue.enqueueMessageCheck(chatJid);
+            continue;
           }
 
           // Pull all messages since lastAgentTimestamp so non-trigger

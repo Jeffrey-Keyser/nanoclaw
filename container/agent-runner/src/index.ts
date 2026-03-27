@@ -541,6 +541,144 @@ async function main(): Promise<void> {
     prompt += '\n' + pending.join('\n');
   }
 
+  // --- Slash command handling ---
+  // Only known session slash commands are handled here. This prevents
+  // accidental interception of user prompts that happen to start with '/'.
+  const KNOWN_SESSION_COMMANDS = new Set(['/compact', '/clear']);
+  const trimmedPrompt = prompt.trim();
+  const isSessionSlashCommand = KNOWN_SESSION_COMMANDS.has(trimmedPrompt);
+
+  if (isSessionSlashCommand) {
+    log(`Handling session command: ${trimmedPrompt}`);
+
+    if (trimmedPrompt === '/clear') {
+      // /clear: archive the transcript then exit without running SDK /compact.
+      // The host will handle DB/in-memory session deletion.
+      try {
+        // Find the transcript to archive
+        const transcriptDir = '/workspace/group/.claude/sessions';
+        let archived = false;
+
+        if (sessionId && fs.existsSync(transcriptDir)) {
+          const transcriptPath = path.join(transcriptDir, sessionId, 'transcript.jsonl');
+          if (fs.existsSync(transcriptPath)) {
+            // Manually invoke the PreCompact archive logic
+            const hook = createPreCompactHook(containerInput.assistantName);
+            await hook(
+              { transcript_path: transcriptPath, session_id: sessionId } as PreCompactHookInput,
+              undefined as unknown as string,
+              undefined as unknown as Parameters<HookCallback>[2],
+            );
+            archived = true;
+            log('Conversation archived before clear');
+          }
+        }
+
+        if (!archived) {
+          log('No transcript found to archive (new or empty session)');
+        }
+
+        writeOutput({
+          status: 'success',
+          result: null,
+          newSessionId: sessionId,
+        });
+      } catch (err) {
+        const errorMsg = err instanceof Error ? err.message : String(err);
+        log(`/clear archive error: ${errorMsg}`);
+        writeOutput({ status: 'error', result: null, error: errorMsg });
+      }
+      return;
+    }
+
+    // /compact: forward to SDK which triggers PreCompact hook and compaction
+    let slashSessionId: string | undefined;
+    let compactBoundarySeen = false;
+    let hadError = false;
+    let resultEmitted = false;
+
+    try {
+      for await (const message of query({
+        prompt: trimmedPrompt,
+        options: {
+          cwd: '/workspace/group',
+          resume: sessionId,
+          systemPrompt: undefined,
+          allowedTools: [],
+          env: sdkEnv,
+          permissionMode: 'bypassPermissions' as const,
+          allowDangerouslySkipPermissions: true,
+          settingSources: ['project', 'user'] as const,
+          hooks: {
+            PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+          },
+        },
+      })) {
+        const msgType = message.type === 'system'
+          ? `system/${(message as { subtype?: string }).subtype}`
+          : message.type;
+        log(`[slash-cmd] type=${msgType}`);
+
+        if (message.type === 'system' && message.subtype === 'init') {
+          slashSessionId = message.session_id;
+          log(`Session after slash command: ${slashSessionId}`);
+        }
+
+        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+          compactBoundarySeen = true;
+          log('Compact boundary observed — compaction completed');
+        }
+
+        if (message.type === 'result') {
+          const resultSubtype = (message as { subtype?: string }).subtype;
+          const textResult = 'result' in message ? (message as { result?: string }).result : null;
+
+          if (resultSubtype?.startsWith('error')) {
+            hadError = true;
+            writeOutput({
+              status: 'error',
+              result: null,
+              error: textResult || 'Session command failed.',
+              newSessionId: slashSessionId,
+            });
+          } else {
+            writeOutput({
+              status: 'success',
+              result: textResult || 'Conversation compacted.',
+              newSessionId: slashSessionId,
+            });
+          }
+          resultEmitted = true;
+        }
+      }
+    } catch (err) {
+      hadError = true;
+      const errorMsg = err instanceof Error ? err.message : String(err);
+      log(`Slash command error: ${errorMsg}`);
+      writeOutput({ status: 'error', result: null, error: errorMsg });
+    }
+
+    log(`Slash command done. compactBoundarySeen=${compactBoundarySeen}, hadError=${hadError}`);
+
+    if (!hadError && !compactBoundarySeen) {
+      log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
+    }
+
+    if (!resultEmitted && !hadError) {
+      writeOutput({
+        status: 'success',
+        result: compactBoundarySeen
+          ? 'Conversation compacted.'
+          : 'Compaction requested but compact_boundary was not observed.',
+        newSessionId: slashSessionId,
+      });
+    } else if (!hadError) {
+      writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
+    }
+    return;
+  }
+  // --- End slash command handling ---
+
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
   try {
