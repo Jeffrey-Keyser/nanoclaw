@@ -556,6 +556,97 @@ describe('agency-hq-dispatcher', () => {
       expect(dispatchSkipTicks.has('t-recover')).toBe(false);
     });
 
+    it('skips implementation tasks assigned to CEO agent', async () => {
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({
+          data: [
+            {
+              id: 't-ceo-impl',
+              title: 'Implementation Task',
+              description: 'Build feature',
+              status: 'ready',
+              repository: 'org/repo',
+              assigned_to: 'agency/leadership/ceo',
+            },
+          ],
+        }),
+      );
+      const deps = makeMockDeps();
+
+      await dispatchReadyTasks(deps);
+
+      // Only the initial GET, no PUT for in-progress
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(
+        deps.queue.enqueueTask as ReturnType<typeof vi.fn>,
+      ).not.toHaveBeenCalled();
+    });
+
+    it('dispatches non-implementation tasks to CEO agent normally', async () => {
+      // GET ready tasks — CEO task without repository field
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({
+          data: [
+            {
+              id: 't-ceo-plan',
+              title: 'Planning Task',
+              description: 'Plan feature',
+              status: 'ready',
+              assigned_to: 'agency/leadership/ceo',
+            },
+          ],
+        }),
+      );
+      // PUT in-progress
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+      // GET persona
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({ data: { value: '# CEO Persona' } }),
+      );
+
+      const deps = makeMockDeps();
+      await dispatchReadyTasks(deps);
+
+      // Should have dispatched: GET tasks, PUT in-progress, GET persona
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(
+        deps.queue.enqueueTask as ReturnType<typeof vi.fn>,
+      ).toHaveBeenCalledTimes(1);
+    });
+
+    it('dispatches implementation tasks to engineering-lead agent normally', async () => {
+      // GET ready tasks — engineering agent with repository field
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({
+          data: [
+            {
+              id: 't-eng-impl',
+              title: 'Implementation Task',
+              description: 'Build feature',
+              status: 'ready',
+              repository: 'org/repo',
+              assigned_to: 'agency/engineering/engineering-lead',
+            },
+          ],
+        }),
+      );
+      // PUT in-progress
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({}));
+      // GET persona
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({ data: { value: '# Engineering Persona' } }),
+      );
+
+      const deps = makeMockDeps();
+      await dispatchReadyTasks(deps);
+
+      // Should have dispatched normally
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(
+        deps.queue.enqueueTask as ReturnType<typeof vi.fn>,
+      ).toHaveBeenCalledTimes(1);
+    });
+
     it('skips dispatch when CEO group is not registered', async () => {
       const deps = makeMockDeps({
         registeredGroups: () => ({}),

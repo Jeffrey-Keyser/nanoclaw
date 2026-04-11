@@ -243,6 +243,20 @@ export async function dispatchReadyTasks(
         }
       }
 
+      // ── Agent capability filtering ────────────────────────────────────────
+      // Tasks with a `repository` field are implementation tasks that require
+      // code-level work (worktree creation, git operations, build tooling).
+      // The CEO agent (assigned_to starting with 'agency/leadership/ceo') is a
+      // strategic/planning persona and must not receive implementation tasks.
+      // Engineering-lead and other implementation-focused agents are unaffected.
+      if (task.repository && task.assigned_to?.startsWith('agency/leadership/ceo')) {
+        log.debug(
+          { taskId: task.id, assignedTo: task.assigned_to },
+          'Skipping implementation task for CEO agent (capability filter)',
+        );
+        continue;
+      }
+
       // Exponential backoff: skip ticks if the task is cooling down from a prior failure
       const remainingSkips = dispatchSkipTicks.get(task.id) ?? 0;
       if (remainingSkips > 0) {
