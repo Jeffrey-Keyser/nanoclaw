@@ -82,6 +82,15 @@ export const lockedWorkerSlots = new Set<string>();
 
 const DEFAULT_PLANNING_PERSONA = 'agency/leadership/engineering-manager';
 
+/**
+ * Agent personas that are excluded from implementation tasks (tasks with a
+ * repository field).  These are leadership/strategy roles that should not be
+ * assigned to hands-on code changes.
+ */
+export const IMPLEMENTATION_EXCLUDED_AGENTS = new Set([
+  'agency/leadership/ceo',
+]);
+
 // --- Helpers ---
 
 /**
@@ -219,6 +228,21 @@ export async function dispatchReadyTasks(
         log.debug({ taskId: task.id }, 'Skipping held task');
         continue;
       }
+
+      // Capability filter: exclude leadership-only agents from implementation
+      // tasks (tasks with a repository field that require code changes).
+      if (
+        task.repository &&
+        task.assigned_to &&
+        IMPLEMENTATION_EXCLUDED_AGENTS.has(task.assigned_to)
+      ) {
+        log.debug(
+          { taskId: task.id, assigned_to: task.assigned_to },
+          'Skipping task: agent excluded from implementation tasks',
+        );
+        continue;
+      }
+
       if (task.scheduled_dispatch_at) {
         const scheduledAt = new Date(task.scheduled_dispatch_at).getTime();
         if (scheduledAt > Date.now()) {
