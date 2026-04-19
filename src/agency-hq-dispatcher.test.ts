@@ -4,7 +4,7 @@ vi.mock('./task-scheduler.js', async (importOriginal) => {
   const actual = (await importOriginal()) as Record<string, unknown>;
   return {
     ...actual,
-    runScheduledTask: vi.fn().mockResolvedValue(null),
+    runScheduledTask: vi.fn().mockResolvedValue({ result: null, error: null }),
   };
 });
 

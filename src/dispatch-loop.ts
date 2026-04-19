@@ -9,7 +9,7 @@ import {
 } from './agency-hq-client.js';
 import { dispatchTime } from './stall-detector.js';
 import { createCorrelationLogger } from './logger.js';
-import { SchedulerDependencies, runScheduledTask } from './task-scheduler.js';
+import { SchedulerDependencies, runScheduledTask, ScheduledTaskOutcome } from './task-scheduler.js';
 import {
   claimSlot,
   freeSlot,
@@ -530,7 +530,7 @@ async function dispatchTask(
         await markSlotExecuting(capturedClaim.slotId, task.id);
       }
 
-      const result = await runScheduledTask(localTask, deps);
+      const outcome: ScheduledTaskOutcome = await runScheduledTask(localTask, deps);
 
       // --- Phase 3: Releasing (writing results back to Agency HQ) ---
       if (capturedClaim) {
@@ -538,8 +538,8 @@ async function dispatchTask(
       }
 
       // Write result back to Agency HQ (programmatic — doesn't rely on agent)
-      const resultPayload = result
-        ? { summary: result.slice(0, 2000) }
+      const resultPayload = outcome.result
+        ? { summary: outcome.result.slice(0, 2000) }
         : { summary: 'Task completed (no output captured)' };
 
       // Fetch existing context so we merge rather than replace
@@ -567,11 +567,22 @@ async function dispatchTask(
 
       const mergedContext = { ...existingContext, result: resultPayload };
 
+      // Determine actual outcome: only mark 'done' if the local task
+      // succeeded. Failed tasks revert to 'ready' so they are retried.
+      const taskSucceeded = outcome.error === null;
+      const ahqStatus = taskSucceeded ? 'done' : 'ready';
+      if (!taskSucceeded) {
+        log.warn(
+          { taskId: task.id, error: outcome.error },
+          'Task failed, reverting to ready for retry',
+        );
+      }
+
       try {
         const res = await agencyFetch(`/tasks/${task.id}`, {
           method: 'PUT',
           body: JSON.stringify({
-            status: 'done',
+            status: ahqStatus,
             context: mergedContext,
           }),
         });
@@ -582,7 +593,10 @@ async function dispatchTask(
             'Failed to write result back to Agency HQ',
           );
         } else {
-          log.info({ taskId: task.id }, 'Result written back to Agency HQ');
+          log.info(
+            { taskId: task.id, ahqStatus },
+            'Result written back to Agency HQ',
+          );
         }
       } catch (err) {
         log.error(
@@ -591,9 +605,12 @@ async function dispatchTask(
         );
       }
 
-      // Clean up dispatch tracking (task succeeded — clear all backoff state)
-      dispatchRetryCount.delete(task.id);
-      dispatchSkipTicks.delete(task.id);
+      // Clean up dispatch tracking on success — clear all backoff state.
+      // On failure, backoff state is preserved so retries use exponential backoff.
+      if (taskSucceeded) {
+        dispatchRetryCount.delete(task.id);
+        dispatchSkipTicks.delete(task.id);
+      }
       dispatchTime.delete(task.id);
     } finally {
       // --- Phase 4: Free slot (from any state) ---
