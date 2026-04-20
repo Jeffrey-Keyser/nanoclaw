@@ -322,6 +322,125 @@ function jsonResponse(
   res.end(JSON.stringify(body));
 }
 
+// --- Send validation ---
+
+const VALID_PARSE_MODES = ['MarkdownV2', 'HTML', 'Markdown'] as const;
+type ParseMode = (typeof VALID_PARSE_MODES)[number];
+
+interface SendRequest {
+  chatId: string;
+  text: string;
+  parseMode?: ParseMode;
+}
+
+function validateSendRequest(
+  body: unknown,
+): { ok: true; data: SendRequest } | { ok: false; error: string } {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, error: 'Request body must be a JSON object' };
+  }
+
+  const obj = body as Record<string, unknown>;
+
+  if (!obj.chatId || typeof obj.chatId !== 'string') {
+    return { ok: false, error: 'chatId is required and must be a string' };
+  }
+  if (!obj.text || typeof obj.text !== 'string') {
+    return { ok: false, error: 'text is required and must be a string' };
+  }
+
+  if (
+    obj.parseMode !== undefined &&
+    !VALID_PARSE_MODES.includes(obj.parseMode as ParseMode)
+  ) {
+    return {
+      ok: false,
+      error: `parseMode must be one of: ${VALID_PARSE_MODES.join(', ')}`,
+    };
+  }
+
+  return {
+    ok: true,
+    data: {
+      chatId: obj.chatId as string,
+      text: obj.text as string,
+      parseMode: obj.parseMode as ParseMode | undefined,
+    },
+  };
+}
+
+// --- Send route handler ---
+
+async function handleSendMessage(
+  req: IncomingMessage,
+  res: ServerResponse,
+  sendFn: (jid: string, text: string) => Promise<void>,
+): Promise<void> {
+  let body: unknown;
+  try {
+    const raw = await readBody(req);
+    body = JSON.parse(raw);
+  } catch {
+    jsonResponse(res, 400, { error: 'Invalid JSON body' });
+    return;
+  }
+
+  const validation = validateSendRequest(body);
+  if (!validation.ok) {
+    jsonResponse(res, 400, { error: validation.error });
+    return;
+  }
+
+  const data = validation.data;
+
+  // Rate limiting (reuses same window/max as the messages endpoint)
+  const recentCount = countRecentMessages(data.chatId, RATE_LIMIT_WINDOW_MS);
+  if (recentCount >= RATE_LIMIT_MAX) {
+    jsonResponse(res, 429, {
+      error: `Rate limit exceeded: max ${RATE_LIMIT_MAX} messages per ${RATE_LIMIT_WINDOW_MS / 1000}s for this recipient`,
+    });
+    return;
+  }
+
+  // Record in outbound_messages for audit trail
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+
+  insertOutboundMessage({
+    id,
+    recipient_id: data.chatId,
+    recipient_type: 'channel_jid',
+    template: 'custom',
+    content: data.text,
+    priority: 'normal',
+    status: 'sending',
+    scheduled_for: null,
+    batch_key: null,
+    batch_window: 0,
+    created_at: now,
+  });
+
+  // Synchronous delivery — await the send and report success/failure
+  try {
+    await sendFn(data.chatId, data.text);
+    updateMessageStatus(id, 'sent');
+    logger.info(
+      { messageId: id, chatId: data.chatId },
+      'Send message delivered',
+    );
+    jsonResponse(res, 200, { id, status: 'sent' });
+  } catch (err) {
+    const errMsg =
+      err instanceof Error ? err.message : 'Unknown delivery error';
+    updateMessageStatus(id, 'failed', errMsg);
+    logger.error(
+      { messageId: id, chatId: data.chatId, err },
+      'Send message delivery failed',
+    );
+    jsonResponse(res, 502, { id, status: 'failed', error: errMsg });
+  }
+}
+
 // --- Route handler ---
 
 async function handlePostMessage(
@@ -422,6 +541,17 @@ export function startMessageApi(
 
   return new Promise((resolve, reject) => {
     httpServer = createServer(async (req, res) => {
+      // POST /api/v1/messages/send — thin direct-send endpoint
+      if (req.method === 'POST' && req.url === '/api/v1/messages/send') {
+        try {
+          await handleSendMessage(req, res, sendFn);
+        } catch (err) {
+          logger.error({ err }, 'Unhandled error in send message API');
+          jsonResponse(res, 500, { error: 'Internal server error' });
+        }
+        return;
+      }
+
       // POST /api/v1/messages
       if (req.method === 'POST' && req.url === '/api/v1/messages') {
         try {
@@ -494,9 +624,13 @@ export function stopMessageApi(): Promise<void> {
 /** @internal — exported for testing */
 export {
   validateRequest as _validateRequest,
+  validateSendRequest as _validateSendRequest,
   handlePostMessage as _handlePostMessage,
+  handleSendMessage as _handleSendMessage,
   deliverWithRetry as _deliverWithRetry,
   flushBatch as _flushBatch,
   RATE_LIMIT_MAX as _RATE_LIMIT_MAX,
   RATE_LIMIT_WINDOW_MS as _RATE_LIMIT_WINDOW_MS,
+  VALID_PARSE_MODES as _VALID_PARSE_MODES,
 };
+export type { SendRequest, ParseMode };
