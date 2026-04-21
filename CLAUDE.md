@@ -105,6 +105,34 @@ There is no dedicated API endpoint for clearing the block — manual SQL against
 
 The in-memory retry counter (`dispatchRetryCount` in `src/dispatch-loop.ts`) resets on process restart, so restarting NanoClaw also clears the local retry state (but does not clear `dispatch_blocked_until` in Agency HQ — you must clear that separately).
 
+## Task Dependency Resolution (blocked_by)
+
+Tasks in Agency HQ can declare dependencies on other tasks via the `blocked_by` field — an array of task IDs that must complete before the dependent task can be dispatched.
+
+**How it works:**
+
+1. When the dispatch loop fetches ready tasks, it checks each task's `blocked_by` array before claiming a slot.
+2. For each dependency ID, it fetches the task from Agency HQ and checks its status.
+3. If any dependency is not in `done` or `cancelled` status, the task is moved to `blocked` and skipped.
+4. When a task completes successfully, `unblockDependents()` queries all blocked tasks and transitions any whose dependencies are now fully resolved back to `ready`.
+
+**Creating tasks with dependencies in Agency HQ:**
+
+```json
+{
+  "title": "Deploy to production",
+  "description": "Deploy the release",
+  "status": "ready",
+  "blocked_by": ["<task-id-for-run-tests>", "<task-id-for-build>"]
+}
+```
+
+The deploy task will remain blocked until both the test and build tasks reach `done` or `cancelled` status.
+
+**Dispatch gate order:** The dependency check runs after `dispatch_blocked_until` but before exponential backoff, so a task with unsatisfied dependencies is moved to `blocked` status promptly rather than consuming backoff ticks.
+
+**Auto-unblock:** When a task completes, the dispatch loop automatically checks all `blocked` tasks and transitions eligible ones to `ready`. No manual intervention is required for the normal dependency flow.
+
 ## Container Build Cache
 
 Historical note: container build cache guidance only matters for experimental or historical runtime work. It is not part of the current default tmux runtime.

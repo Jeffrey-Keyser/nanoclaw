@@ -167,6 +167,185 @@ export async function buildPrompt(
   return parts.join('\n');
 }
 
+// --- Dependency Resolution ---
+
+/**
+ * Check whether a task is blocked by unsatisfied dependencies.
+ *
+ * Iterates through the task's `blocked_by` array and fetches each dependency's
+ * status from Agency HQ. If any dependency is not in 'done' or 'cancelled'
+ * status, the task is moved to 'blocked' and the function returns true.
+ *
+ * Returns true if the task is blocked, false if all dependencies are satisfied.
+ */
+async function isBlockedByDependencies(
+  task: AgencyHqTask,
+  log: ReturnType<typeof createCorrelationLogger>,
+): Promise<boolean> {
+  if (!task.blocked_by || task.blocked_by.length === 0) return false;
+
+  for (const depId of task.blocked_by) {
+    try {
+      const res = await agencyFetch(`/tasks/${depId}`);
+      if (!res.ok) {
+        log.warn(
+          { taskId: task.id, depId, status: res.status },
+          'Dependency check: failed to fetch dependency task, treating as unresolved',
+        );
+        await setTaskBlocked(task.id, task.blocked_by, log);
+        return true;
+      }
+      const json = (await res.json()) as {
+        success: boolean;
+        data?: { status: string };
+      };
+      const depStatus = json.data?.status;
+      if (depStatus !== 'done' && depStatus !== 'cancelled') {
+        log.info(
+          { taskId: task.id, depId, depStatus },
+          'Dependency check: blocking dependency not yet resolved, skipping task',
+        );
+        await setTaskBlocked(task.id, task.blocked_by, log);
+        return true;
+      }
+      log.debug(
+        { taskId: task.id, depId, depStatus },
+        'Dependency check: dependency satisfied',
+      );
+    } catch (err) {
+      log.warn(
+        { taskId: task.id, depId, err },
+        'Dependency check: error fetching dependency, treating as unresolved',
+      );
+      await setTaskBlocked(task.id, task.blocked_by, log);
+      return true;
+    }
+  }
+
+  log.info(
+    { taskId: task.id, dependencyCount: task.blocked_by.length },
+    'Dependency check: all dependencies satisfied, task eligible for dispatch',
+  );
+  return false;
+}
+
+/**
+ * Move a task to 'blocked' status in Agency HQ due to unsatisfied dependencies.
+ */
+async function setTaskBlocked(
+  taskId: string,
+  blockedBy: string[],
+  log: ReturnType<typeof createCorrelationLogger>,
+): Promise<void> {
+  try {
+    await agencyFetch(`/tasks/${taskId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ status: 'blocked' }),
+    });
+    log.info(
+      { taskId, blockedBy },
+      'Task moved to blocked status due to unsatisfied dependencies',
+    );
+  } catch (err) {
+    log.error(
+      { err, taskId },
+      'Failed to set task blocked for dependency resolution',
+    );
+  }
+}
+
+/**
+ * After a task completes, check if any blocked tasks were waiting on it
+ * and unblock them if all their dependencies are now satisfied.
+ *
+ * Queries Agency HQ for tasks in 'blocked' status, then for each task
+ * whose blocked_by array includes the completed task ID, verifies all
+ * other dependencies are also resolved. If so, transitions the task to 'ready'.
+ */
+export async function unblockDependents(
+  completedTaskId: string,
+  log: ReturnType<typeof createCorrelationLogger>,
+): Promise<void> {
+  let blockedTasks: AgencyHqTask[];
+  try {
+    const res = await agencyFetch('/tasks?status=blocked');
+    if (!res.ok) {
+      log.warn(
+        { status: res.status },
+        'unblockDependents: failed to fetch blocked tasks',
+      );
+      return;
+    }
+    const json = (await res.json()) as {
+      success: boolean;
+      data: AgencyHqTask[];
+    };
+    blockedTasks = json.data ?? [];
+  } catch (err) {
+    log.warn({ err }, 'unblockDependents: error fetching blocked tasks');
+    return;
+  }
+
+  for (const task of blockedTasks) {
+    if (!task.blocked_by || !task.blocked_by.includes(completedTaskId)) {
+      continue;
+    }
+
+    // Check if all other dependencies are also resolved
+    let allResolved = true;
+    for (const depId of task.blocked_by) {
+      if (depId === completedTaskId) continue; // We know this one is done
+
+      try {
+        const res = await agencyFetch(`/tasks/${depId}`);
+        if (!res.ok) {
+          allResolved = false;
+          break;
+        }
+        const json = (await res.json()) as {
+          success: boolean;
+          data?: { status: string };
+        };
+        const depStatus = json.data?.status;
+        if (depStatus !== 'done' && depStatus !== 'cancelled') {
+          log.debug(
+            { taskId: task.id, depId, depStatus },
+            'unblockDependents: other dependency still incomplete',
+          );
+          allResolved = false;
+          break;
+        }
+      } catch {
+        allResolved = false;
+        break;
+      }
+    }
+
+    if (allResolved) {
+      try {
+        await agencyFetch(`/tasks/${task.id}`, {
+          method: 'PUT',
+          body: JSON.stringify({ status: 'ready' }),
+        });
+        log.info(
+          { taskId: task.id, completedDep: completedTaskId },
+          'unblockDependents: all dependencies resolved, task moved to ready',
+        );
+      } catch (err) {
+        log.error(
+          { err, taskId: task.id },
+          'unblockDependents: failed to unblock task',
+        );
+      }
+    } else {
+      log.debug(
+        { taskId: task.id, completedDep: completedTaskId },
+        'unblockDependents: task still has unresolved dependencies',
+      );
+    }
+  }
+}
+
 // --- Dispatch Loop ---
 
 export async function dispatchReadyTasks(
@@ -246,6 +425,12 @@ export async function dispatchReadyTasks(
           );
           continue;
         }
+      }
+
+      // blocked_by: check if task has unsatisfied dependencies
+      if (task.blocked_by && task.blocked_by.length > 0) {
+        const blocked = await isBlockedByDependencies(task, log);
+        if (blocked) continue;
       }
 
       // Exponential backoff: skip ticks if the task is cooling down from a prior failure
@@ -634,6 +819,9 @@ async function dispatchTask(
         dispatchRetryCount.delete(task.id);
         dispatchSkipTicks.delete(task.id);
         dispatchTime.delete(task.id);
+
+        // Unblock any tasks that were waiting on this one
+        await unblockDependents(task.id, log);
       } else {
         log.warn(
           { taskId: task.id, error: taskResult.error },

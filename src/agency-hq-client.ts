@@ -17,6 +17,8 @@ export interface AgencyHqTask {
   dispatch_attempts?: number;
   dispatched_at?: string;
   updated_at?: string;
+  /** Task IDs that must be in 'done' or 'cancelled' status before this task can be dispatched. */
+  blocked_by?: string[];
 }
 
 export interface AgencyHqSprint {
