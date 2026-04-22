@@ -14,7 +14,6 @@ import {
   buildOpsPrompt,
   executeTask,
   reportResult,
-  processTask,
   pollTick,
   startPolling,
   shutdown,
@@ -310,6 +309,90 @@ describe('ops-agent/worker', () => {
 
       // Should not throw
       await pollTick();
+    });
+  });
+
+  describe('full lifecycle: poll -> claim -> execute -> complete', () => {
+    it('processes a task end-to-end through pollTick', async () => {
+      const task = makeMockTask();
+
+      // 1. fetchOpsTasks — returns one ready task
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({ success: true, data: [task] }),
+      );
+      // 2. claimTask — PUT in-progress
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({ success: true }));
+      // 3. buildOpsPrompt — persona fetch
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({
+          data: { value: 'You are an ops engineer.' },
+        }),
+      );
+      // 4. reportResult — GET existing context
+      fetchMock.mockResolvedValueOnce(
+        mockFetchResponse({ success: true, data: { context: {} } }),
+      );
+      // 5. reportResult — PUT done
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({ success: true }));
+      // 6. reportResult — POST notification
+      fetchMock.mockResolvedValueOnce(mockFetchResponse({ success: true }));
+
+      // Mock spawn for executeTask
+      const mockProc = {
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        stdin: { end: vi.fn() },
+        on: vi.fn(),
+      };
+      vi.mocked(spawn).mockReturnValue(mockProc as never);
+
+      const pollPromise = pollTick();
+
+      // Wait for spawn to be called, then simulate CLI output
+      await vi.advanceTimersByTimeAsync(0);
+
+      const stdoutHandler = mockProc.stdout.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'data',
+      )![1];
+      stdoutHandler(Buffer.from('Disk usage: 42%'));
+
+      const closeHandler = mockProc.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'close',
+      )![1];
+      closeHandler(0);
+
+      await pollPromise;
+
+      // Verify the full sequence of API calls:
+      expect(fetchMock).toHaveBeenCalledTimes(6);
+
+      // Call 1: fetch tasks
+      expect(fetchMock.mock.calls[0][0]).toContain(
+        '/tasks?task_type=ops&status=ready',
+      );
+
+      // Call 2: claim task (PUT in-progress)
+      expect(fetchMock.mock.calls[1][0]).toContain(`/tasks/${task.id}`);
+      expect(fetchMock.mock.calls[1][1].method).toBe('PUT');
+      const claimBody = JSON.parse(fetchMock.mock.calls[1][1].body);
+      expect(claimBody.status).toBe('in-progress');
+
+      // Call 3: persona fetch for prompt building
+      expect(fetchMock.mock.calls[2][0]).toContain('/prompts/');
+
+      // Call 4: GET task for context merge
+      expect(fetchMock.mock.calls[3][0]).toContain(`/tasks/${task.id}`);
+
+      // Call 5: PUT result (done)
+      expect(fetchMock.mock.calls[4][0]).toContain(`/tasks/${task.id}`);
+      expect(fetchMock.mock.calls[4][1].method).toBe('PUT');
+      const resultBody = JSON.parse(fetchMock.mock.calls[4][1].body);
+      expect(resultBody.status).toBe('done');
+      expect(resultBody.context.result.summary).toContain('Disk usage: 42%');
+
+      // Call 6: POST notification
+      expect(fetchMock.mock.calls[5][0]).toContain('/notifications');
+      expect(fetchMock.mock.calls[5][1].method).toBe('POST');
     });
   });
 
