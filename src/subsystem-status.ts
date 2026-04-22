@@ -101,6 +101,13 @@ const subsystemDefaults: Array<Omit<SubsystemStatus, 'updatedAt'>> = [
     details: 'Not started yet.',
   },
   {
+    id: 'crash-watchdog',
+    label: 'Crash watchdog',
+    classification: 'production',
+    state: 'disabled',
+    details: 'Not started yet.',
+  },
+  {
     id: 'meeting-engine',
     label: 'Meeting engine',
     classification: 'experimental',

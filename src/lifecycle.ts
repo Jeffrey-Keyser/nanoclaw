@@ -54,6 +54,8 @@ import {
 import { setSubsystemState } from './subsystem-status.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { startUptimeMonitor, stopUptimeMonitor } from './uptime-monitor.js';
+import { createFollowUpTaskEmitter } from './crash-handler.js';
+import { startCrashWatchdog, stopCrashWatchdog } from './crash-watchdog.js';
 import { NotificationBatcher } from './notification-batcher.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -214,6 +216,11 @@ export async function initApp(): Promise<void> {
       await notificationBatcher.flushAll();
       stopUptimeMonitor();
       setSubsystemState('uptime-monitor', {
+        state: 'disabled',
+        details: 'Shutdown requested.',
+      });
+      stopCrashWatchdog();
+      setSubsystemState('crash-watchdog', {
         state: 'disabled',
         details: 'Shutdown requested.',
       });
@@ -447,6 +454,25 @@ export async function initApp(): Promise<void> {
     state: 'running',
     details: 'User-service failure alerts enabled.',
   });
+
+  // Crash watchdog — detects failed systemd services, reads logs, restarts,
+  // sends notifications, and creates follow-up tasks when restart fails.
+  const mainEntry = Object.entries(state.registeredGroups).find(
+    ([, g]) => g.isMain === true,
+  );
+  startCrashWatchdog({
+    registeredGroups: () => state.registeredGroups,
+    sendMessage: schedulerDeps.sendMessage,
+    notificationBatcher,
+    emitFollowUpTask: mainEntry
+      ? createFollowUpTaskEmitter(mainEntry[1].folder)
+      : undefined,
+  });
+  setSubsystemState('crash-watchdog', {
+    state: 'running',
+    details: 'Polling systemd for failed services every 30s.',
+  });
+
   startHostExecWatcher();
   setSubsystemState('host-exec', {
     state: 'running',

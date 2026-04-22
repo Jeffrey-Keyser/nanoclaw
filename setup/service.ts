@@ -319,6 +319,27 @@ function checkDockerGroupStale(): boolean {
   }
 }
 
+/**
+ * Generate a systemd template unit for crash notifications.
+ * When a service fails and has OnFailure=nanoclaw-crash-notify@%n.service,
+ * systemd invokes this unit which writes a JSON event file to the IPC directory.
+ * The NanoClaw crash watchdog picks up the event and triggers the crash handler.
+ *
+ * %i is the failed unit name (passed via the template instance).
+ */
+function generateCrashNotifyUnit(projectRoot: string): string {
+  // The script writes a JSON file to data/ipc/main/tasks/ which the IPC watcher picks up.
+  // We use the main group folder since crash handling is a main-group privilege.
+  const ipcDir = `${projectRoot}/data/crash-events`;
+  return `[Unit]
+Description=NanoClaw crash notification for %i
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'mkdir -p ${ipcDir} && echo "{\\"unit\\":\\"%i\\",\\"timestamp\\":\\"$(date -Iseconds)\\",\\"source\\":\\"onfailure\\"}" > ${ipcDir}/crash-%i-$(date +%%s).json'
+`;
+}
+
 function setupSystemd(
   projectRoot: string,
   nodePath: string,
@@ -351,9 +372,19 @@ function setupSystemd(
     systemctlPrefix = 'systemctl --user';
   }
 
+  // Generate crash-notify template service that writes an IPC event on OnFailure
+  const crashNotifyUnit = generateCrashNotifyUnit(projectRoot);
+  const crashNotifyPath = path.join(
+    path.dirname(unitPath),
+    'nanoclaw-crash-notify@.service',
+  );
+  fs.writeFileSync(crashNotifyPath, crashNotifyUnit);
+  logger.info({ crashNotifyPath }, 'Wrote crash-notify template unit');
+
   const unit = `[Unit]
 Description=NanoClaw Personal Assistant
 After=network.target
+OnFailure=nanoclaw-crash-notify@%n.service
 
 [Service]
 Type=simple
