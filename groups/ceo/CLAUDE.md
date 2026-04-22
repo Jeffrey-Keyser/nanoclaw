@@ -125,6 +125,49 @@ You manage a software ecosystem of 40+ repos. Key services:
 
 All services run as systemd user units on the Beelink homelab.
 
+### Ecosystem Service Inventory
+
+Service status matrix based on ecosystem health validation. Use this to understand what's operational before delegating infrastructure or integration tasks.
+
+| Service | Port | Health Endpoint | Status | Notes |
+|---|---|---|---|---|
+| Agency HQ | 3040 | `/api/v1/dashboard` | Operational | Scrum board, task dispatch, dispatch-config API |
+| NanoClaw | 3002 | `/health` | Operational | Skill server, health snapshot, status dashboard |
+| Solo Vault | 443 (HTTPS) | `api.vault.jeffreykeyser.net` | Operational | Encrypted secret storage, service-scoped tokens |
+| Pantry Manager | 3052 | — | Operational | Grocery inventory, nudge engine |
+| RabbitMQ | 5672 | — | Operational | AMQP broker for cron-service subscription |
+| AI Proxy | — | — | Operational | Provider-agnostic AI routing |
+| Pay | — | — | Operational | Auth hub, identity provider |
+| Prompt Registry | — | — | Operational | Prompt versioning and retrieval |
+| Ping | — | — | Operational | Location tracking |
+| Life Journal | — | — | Operational | Personal journaling |
+| Image Studio | — | — | Operational | Image processing and generation |
+| Music Store | — | — | Operational | Music service |
+| Flights | — | — | Operational | Weekly best deals digest |
+| Feedback Registry | — | — | Operational | User feedback collection |
+
+*NanoClaw internal subsystems:*
+
+| Subsystem | Classification | State | Notes |
+|---|---|---|---|
+| Credential proxy | Production | Running | Vault-backed secret fetching |
+| Skill registry | Production | Running | Skill server on port 3002 |
+| Task scheduler | Production | Running | Cron-based task execution |
+| IPC watcher | Production | Running | Inter-process communication |
+| Message API | Production | Running | Inbound/outbound message handling |
+| Agency HQ dispatch | Internal | Running | 4 concurrent worker slots |
+| Stall detector | Internal | Running | 90s early warning, 15min auto-recovery |
+| Host exec watcher | Internal | Running | Host command execution |
+| Uptime monitor | Internal | Running | Service availability tracking |
+| Systemd crash monitor | Internal | Running | Auto-restart and crash alerting |
+| Ops dispatch watchdog | Internal | Running | Slot health and grace period enforcement |
+| Transcript archiver | Internal | On-demand | Activated by /clear flows |
+| Sprint retro watcher | Internal | Dormant | Disabled at startup |
+| Remote control | Experimental | On-demand | Main-group operator sessions only |
+| Meeting engine | Experimental | Disabled | Types/tests exist, not wired into startup |
+
+*How to read this table:* Operational = responding and healthy. On-demand = available but only activates when triggered. Dormant/Disabled = not currently active. If a service shows as requiring attention, create an investigation task before depending on it for sprint work.
+
 ## Sprint Cycle
 
 1. Jeff sets objectives (or you propose them based on ecosystem needs)
