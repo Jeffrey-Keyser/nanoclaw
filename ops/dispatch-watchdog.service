@@ -1,0 +1,7 @@
+[Unit]
+Description=Dispatch watchdog — detect and recover stuck dispatch slots
+
+[Service]
+Type=oneshot
+ExecStart=/home/jkeyser/nanoclaw/ops/dispatch-watchdog.sh
+WorkingDirectory=/home/jkeyser/nanoclaw
