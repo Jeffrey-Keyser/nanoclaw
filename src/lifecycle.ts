@@ -54,6 +54,11 @@ import {
 import { setSubsystemState } from './subsystem-status.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { startUptimeMonitor, stopUptimeMonitor } from './uptime-monitor.js';
+import {
+  loadCrashMonitorConfig,
+  startCrashMonitor,
+  stopCrashMonitor,
+} from './systemd-crash-monitor.js';
 import { NotificationBatcher } from './notification-batcher.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -214,6 +219,11 @@ export async function initApp(): Promise<void> {
       await notificationBatcher.flushAll();
       stopUptimeMonitor();
       setSubsystemState('uptime-monitor', {
+        state: 'disabled',
+        details: 'Shutdown requested.',
+      });
+      stopCrashMonitor();
+      setSubsystemState('crash-monitor', {
         state: 'disabled',
         details: 'Shutdown requested.',
       });
@@ -447,6 +457,23 @@ export async function initApp(): Promise<void> {
     state: 'running',
     details: 'User-service failure alerts enabled.',
   });
+  const crashMonitorConfig = loadCrashMonitorConfig();
+  if (crashMonitorConfig) {
+    startCrashMonitor(crashMonitorConfig, {
+      registeredGroups: () => state.registeredGroups,
+      sendMessage: schedulerDeps.sendMessage,
+      notificationBatcher,
+    });
+    setSubsystemState('crash-monitor', {
+      state: 'running',
+      details: `Monitoring ${crashMonitorConfig.services.length} service(s): ${crashMonitorConfig.services.join(', ')}.`,
+    });
+  } else {
+    setSubsystemState('crash-monitor', {
+      state: 'disabled',
+      details: 'No config at ~/.config/nanoclaw/crash-monitor.json.',
+    });
+  }
   startHostExecWatcher();
   setSubsystemState('host-exec', {
     state: 'running',
