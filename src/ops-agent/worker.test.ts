@@ -8,6 +8,13 @@ vi.mock('child_process', () => ({
   spawn: vi.fn(),
 }));
 
+// Mock dispatch-config to avoid real API calls during worker tests
+vi.mock('./dispatch-config.js', () => ({
+  getAgentCliBin: vi.fn().mockReturnValue('claude'),
+  startConfigPolling: vi.fn().mockResolvedValue(vi.fn()),
+  stopConfigPolling: vi.fn(),
+}));
+
 import {
   fetchOpsTasks,
   claimTask,
@@ -19,6 +26,7 @@ import {
   shutdown,
   _resetForTest,
 } from './worker.js';
+import { getAgentCliBin } from './dispatch-config.js';
 import { createCorrelationLogger } from '../logger.js';
 import { spawn } from 'child_process';
 
@@ -205,6 +213,40 @@ describe('ops-agent/worker', () => {
 
       const result = await promise;
       expect(result.error).toBe('Something went wrong');
+    });
+
+    it('uses CLI binary from dispatch-config', async () => {
+      vi.mocked(getAgentCliBin).mockReturnValue('custom-cli');
+
+      const mockProc = {
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        stdin: { end: vi.fn() },
+        on: vi.fn(),
+      };
+
+      vi.mocked(spawn).mockReturnValue(mockProc as never);
+
+      const promise = executeTask('test prompt', 5000);
+
+      expect(spawn).toHaveBeenCalledWith(
+        'custom-cli',
+        ['--print', '--dangerously-skip-permissions', 'test prompt'],
+        expect.objectContaining({
+          stdio: ['pipe', 'pipe', 'pipe'],
+        }),
+      );
+
+      // Complete the process
+      const closeHandler = mockProc.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'close',
+      )![1];
+      closeHandler(0);
+
+      await promise;
+
+      // Restore default mock
+      vi.mocked(getAgentCliBin).mockReturnValue('claude');
     });
 
     it('handles spawn error', async () => {
@@ -397,14 +439,14 @@ describe('ops-agent/worker', () => {
   });
 
   describe('startPolling / shutdown', () => {
-    it('starts polling and can be shut down', () => {
-      const cleanup = startPolling();
+    it('starts polling and can be shut down', async () => {
+      const cleanup = await startPolling();
       expect(typeof cleanup).toBe('function');
       cleanup();
     });
 
     it('stops processing on shutdown', async () => {
-      startPolling();
+      await startPolling();
       shutdown();
 
       // Advance timers — pollTick should not run after shutdown

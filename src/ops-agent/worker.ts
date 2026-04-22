@@ -18,6 +18,7 @@ import {
   type AgencyHqTask,
 } from '../agency-hq-client.js';
 import { AGENCY_HQ_URL, AGENT_CLI_BIN } from '../config.js';
+import { getAgentCliBin, startConfigPolling, stopConfigPolling } from './dispatch-config.js';
 import { createCorrelationLogger, logger } from '../logger.js';
 
 // --- Configuration ---
@@ -108,8 +109,9 @@ export async function executeTask(
   activeAbort = abort;
 
   return new Promise((resolve) => {
+    const cliBin = getAgentCliBin();
     const args = ['--print', '--dangerously-skip-permissions', prompt];
-    const proc = spawn(AGENT_CLI_BIN, args, {
+    const proc = spawn(cliBin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       signal: abort.signal,
       env: { ...process.env },
@@ -317,13 +319,16 @@ export async function pollTick(): Promise<void> {
 }
 
 /** Start the polling loop. Returns a cleanup function. */
-export function startPolling(): () => void {
+export async function startPolling(): Promise<() => void> {
+  // Fetch dispatch config before starting task polling
+  await startConfigPolling();
+
   logger.info(
     {
       pollIntervalMs: OPS_POLL_INTERVAL_MS,
       taskTimeoutMs: OPS_TASK_TIMEOUT_MS,
       agencyHqUrl: AGENCY_HQ_URL,
-      cliBin: AGENT_CLI_BIN,
+      cliBin: getAgentCliBin(),
     },
     'Ops-agent worker starting',
   );
@@ -348,6 +353,8 @@ export function shutdown(): void {
   stopping = true;
   logger.info('Ops-agent worker shutting down');
 
+  stopConfigPolling();
+
   if (pollTimer) {
     clearTimeout(pollTimer);
     pollTimer = null;
@@ -365,6 +372,7 @@ export function _resetForTest(): void {
   stopping = false;
   pollTimer = null;
   activeAbort = null;
+  // Note: dispatch-config has its own _resetForTest — callers should call both
 }
 
 // --- Entrypoint ---
@@ -381,15 +389,15 @@ if (process.argv[1] && process.argv[1].includes('ops-agent/worker')) {
     process.exit(1);
   }
 
-  const cleanup = startPolling();
+  startPolling().then((cleanup) => {
+    process.on('SIGTERM', () => {
+      logger.info('Received SIGTERM');
+      cleanup();
+    });
 
-  process.on('SIGTERM', () => {
-    logger.info('Received SIGTERM');
-    cleanup();
-  });
-
-  process.on('SIGINT', () => {
-    logger.info('Received SIGINT');
-    cleanup();
+    process.on('SIGINT', () => {
+      logger.info('Received SIGINT');
+      cleanup();
+    });
   });
 }
