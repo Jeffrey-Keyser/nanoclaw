@@ -47,10 +47,33 @@ Bash scripts under `scripts/git/` for dev-inbox PR workflow:
 | Script             | Usage                                                       |
 | ------------------ | ----------------------------------------------------------- |
 | `create-pr`        | `create-pr <branch> [--title <t>] [--auto-merge] [--base <b>]` |
-| `merge-pr`         | `merge-pr <pr-number> [--squash\|--merge\|--rebase]`        |
+| `merge-pr`         | `merge-pr <pr-number> [--squash\|--merge\|--rebase] [--ci-timeout <sec>]` |
 | `create-and-merge` | `create-and-merge <branch> [options]` — runs both in sequence |
 
-Edge cases handled: worktree lock conflicts, no commits vs base, already-merged PRs, gh CLI API failures (retry with backoff), CI check wait with timeout, branch cleanup errors, missing branches.
+**Reliability features:**
+- **Auto-retry with exponential backoff**: Network timeouts, GitHub API rate limits, and transient server errors trigger automatic retries (up to 3 attempts)
+- **Intelligent error classification**: Distinguishes between retryable (network, rate limit, 5xx) and non-retryable (auth, validation, 4xx) errors
+- **Fetch-and-recheck for false negatives**: "No commits" errors trigger a fresh fetch and re-validation to catch rebase/force-push scenarios
+- **Detailed error messages**: Each failure mode includes specific troubleshooting steps and example commands
+- **Worktree conflict handling**: Detects locked worktrees and suggests multiple resolution paths
+- **CI wait with progress**: Polls CI status every 10s with live progress updates and API error recovery
+- **Concurrent operation detection**: Handles race conditions when PRs are created/merged externally during execution
+- **Validation summaries**: Pre-flight and pre-merge validation logs confirm all parameters before GitHub API calls
+
+**Edge cases handled:**
+- Worktree lock conflicts (with cleanup suggestions)
+- No commits vs base (fetch-and-recheck to avoid false positives)
+- Already-merged or duplicate PRs (idempotent operations)
+- gh CLI API failures (retry with backoff, error classification)
+- CI check wait with timeout (configurable, defaults to 300s)
+- Branch cleanup errors after merge (non-fatal warnings)
+- Missing/invalid branches (clear errors with debugging commands)
+- Network transients during push/merge operations
+- GitHub API rate limits (detected and retried with backoff)
+- Authentication errors (fail-fast with re-auth instructions)
+- Merge conflicts (detected with resolution guidance)
+
+See `scripts/git/TEST_SCENARIOS.md` for comprehensive test cases.
 
 ## Development
 

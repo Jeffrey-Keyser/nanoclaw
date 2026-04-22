@@ -78,7 +78,12 @@ if echo "$WORKTREE_LIST" | grep -q "branch refs/heads/${BRANCH}$"; then
   if [[ -n "$WORKTREE_PATH" ]]; then
     warn "Branch '$BRANCH' is checked out in worktree: $WORKTREE_PATH"
     warn "This may cause conflicts during PR operations."
-    warn "To clean up: git worktree remove '$WORKTREE_PATH'"
+    warn ""
+    warn "To clean up the worktree:"
+    warn "  1. Remove the worktree: git worktree remove '$WORKTREE_PATH'"
+    warn "  2. If locked: git worktree remove --force '$WORKTREE_PATH'"
+    warn "  3. Or work from the worktree: cd '$WORKTREE_PATH' && create-pr $BRANCH"
+    warn ""
     # Non-fatal — the PR can still be created from the remote branch.
   fi
 fi
@@ -118,10 +123,44 @@ fi
 
 COMMIT_COUNT=$(git rev-list --count "$BASE_REF".."$BRANCH_REF" 2>/dev/null || echo "0")
 if [[ "$COMMIT_COUNT" -eq 0 ]]; then
-  die "Branch '$BRANCH' has no commits ahead of '$BASE_BRANCH'. Nothing to create a PR for."
+  # Double-check with git log to avoid false positives.
+  # This can happen if the branch was rebased or force-pushed.
+  info "No new commits detected. Verifying with git log..."
+
+  # Fetch latest to ensure we have up-to-date refs.
+  git fetch origin "$BASE_BRANCH" >/dev/null 2>&1 || warn "Could not fetch latest $BASE_BRANCH"
+  if [[ "$BRANCH_EXISTS_REMOTE" == true ]]; then
+    git fetch origin "$BRANCH" >/dev/null 2>&1 || warn "Could not fetch latest $BRANCH"
+  fi
+
+  # Re-check after fetch.
+  COMMIT_COUNT=$(git rev-list --count "$BASE_REF".."$BRANCH_REF" 2>/dev/null || echo "0")
+  if [[ "$COMMIT_COUNT" -eq 0 ]]; then
+    # Show recent commits on both branches for debugging.
+    echo "Recent commits on $BASE_REF:" >&2
+    git log --oneline -5 "$BASE_REF" 2>&1 >&2 || true
+    echo "" >&2
+    echo "Recent commits on $BRANCH_REF:" >&2
+    git log --oneline -5 "$BRANCH_REF" 2>&1 >&2 || true
+    echo "" >&2
+    die "Branch '$BRANCH' has no commits ahead of '$BASE_BRANCH'. Nothing to create a PR for.
+
+To debug:
+  git log $BASE_REF..$BRANCH_REF
+  git fetch origin $BASE_BRANCH $BRANCH
+  git log --oneline --graph $BASE_REF..$BRANCH_REF"
+  fi
 fi
 
 info "Branch '$BRANCH' has $COMMIT_COUNT commit(s) ahead of '$BASE_BRANCH'."
+
+# ---------- validation summary ----------
+info "=== Pre-flight validation passed ==="
+info "  Branch: $BRANCH"
+info "  Base: $BASE_BRANCH"
+info "  Commits: $COMMIT_COUNT"
+info "  Local: $BRANCH_EXISTS_LOCAL, Remote: $BRANCH_EXISTS_REMOTE"
+info ""
 
 # ---------- check for existing PR ----------
 EXISTING_PR=$(gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open --json number,url --jq '.[0].url' 2>/dev/null || true)
@@ -142,7 +181,29 @@ fi
 # ---------- push branch to remote if needed ----------
 if [[ "$BRANCH_EXISTS_REMOTE" == false ]]; then
   info "Pushing '$BRANCH' to origin..."
-  git push -u origin "$BRANCH" || die "Failed to push '$BRANCH' to origin."
+  PUSH_ATTEMPT=0
+  PUSH_MAX_RETRIES=3
+  while [[ $PUSH_ATTEMPT -lt $PUSH_MAX_RETRIES ]]; do
+    PUSH_ATTEMPT=$((PUSH_ATTEMPT + 1))
+    if git push -u origin "$BRANCH" 2>&1; then
+      break
+    else
+      PUSH_EXIT=$?
+      if [[ $PUSH_ATTEMPT -lt $PUSH_MAX_RETRIES ]]; then
+        PUSH_SLEEP=$((BACKOFF_BASE ** PUSH_ATTEMPT))
+        warn "git push failed (attempt $PUSH_ATTEMPT/$PUSH_MAX_RETRIES). Retrying in ${PUSH_SLEEP}s..."
+        sleep "$PUSH_SLEEP"
+      else
+        die "Failed to push '$BRANCH' to origin after $PUSH_MAX_RETRIES attempts (exit code: $PUSH_EXIT).
+
+Troubleshooting:
+  - Check remote: git remote -v
+  - Check connectivity: git fetch origin
+  - Check permissions: gh auth status
+  - Try manual push: git push -u origin $BRANCH"
+      fi
+    fi
+  done
 fi
 
 # ---------- derive PR title ----------
@@ -170,8 +231,12 @@ while [[ $ATTEMPT -lt $MAX_RETRIES ]]; do
     --body "Automated PR from dev-inbox branch \`$BRANCH\`." \
     2>&1) && break
 
+  # Classify the error to determine if we should retry.
+  ERROR_MSG="$PR_URL"
+  SHOULD_RETRY=false
+
   # Check if the error indicates the PR already exists (race condition).
-  if echo "$PR_URL" | grep -qi "already exists"; then
+  if echo "$ERROR_MSG" | grep -qi "already exists"; then
     EXISTING=$(gh pr list --head "$BRANCH" --base "$BASE_BRANCH" --state open --json url --jq '.[0].url' 2>/dev/null || true)
     if [[ -n "$EXISTING" ]]; then
       info "PR was created concurrently: $EXISTING"
@@ -180,12 +245,41 @@ while [[ $ATTEMPT -lt $MAX_RETRIES ]]; do
     fi
   fi
 
-  if [[ $ATTEMPT -lt $MAX_RETRIES ]]; then
-    SLEEP=$((BACKOFF_BASE ** ATTEMPT))
-    warn "gh pr create failed (attempt $ATTEMPT/$MAX_RETRIES). Retrying in ${SLEEP}s..."
-    sleep "$SLEEP"
+  # Retryable errors: network, timeouts, rate limits, server errors.
+  if echo "$ERROR_MSG" | grep -qiE "timeout|timed out|connection|network|rate limit|502|503|504|500"; then
+    SHOULD_RETRY=true
+    warn "Transient error detected: $(echo "$ERROR_MSG" | head -1)"
+  # Non-retryable errors: validation, permissions, not found.
+  elif echo "$ERROR_MSG" | grep -qiE "not found|permission denied|invalid|forbidden|401|403|404|422"; then
+    die "Non-retryable error creating PR: $ERROR_MSG
+
+Common fixes:
+  - Ensure you have push access to the repository
+  - Verify the branch exists: git push -u origin $BRANCH
+  - Check if a PR already exists: gh pr list --head $BRANCH
+  - Verify gh CLI authentication: gh auth status"
   else
-    die "Failed to create PR after $MAX_RETRIES attempts. Last output: $PR_URL"
+    # Unknown error — retry with caution.
+    SHOULD_RETRY=true
+    warn "Unknown error (will retry): $(echo "$ERROR_MSG" | head -1)"
+  fi
+
+  if [[ "$SHOULD_RETRY" == true && $ATTEMPT -lt $MAX_RETRIES ]]; then
+    SLEEP=$((BACKOFF_BASE ** ATTEMPT))
+    warn "Retrying in ${SLEEP}s (attempt $ATTEMPT/$MAX_RETRIES)..."
+    sleep "$SLEEP"
+  elif [[ "$SHOULD_RETRY" == false ]]; then
+    die "Failed to create PR (non-retryable): $ERROR_MSG"
+  else
+    die "Failed to create PR after $MAX_RETRIES attempts.
+
+Last error: $ERROR_MSG
+
+Troubleshooting:
+  1. Check network: curl -I https://api.github.com
+  2. Check auth: gh auth status
+  3. Verify branch: git log $BASE_BRANCH..$BRANCH
+  4. Check existing PRs: gh pr list --head $BRANCH"
   fi
 done
 

@@ -93,15 +93,25 @@ case "$PR_STATE" in
     ;;
 esac
 
-# Capture branch name for later cleanup.
+# Capture branch name and other metadata for validation.
 PR_BRANCH=$(gh pr view "$PR_NUMBER" --json headRefName --jq '.headRefName' 2>/dev/null || true)
-info "Merging PR #$PR_NUMBER (branch: ${PR_BRANCH:-unknown}, strategy: $STRATEGY)"
+PR_TITLE=$(gh pr view "$PR_NUMBER" --json title --jq '.title' 2>/dev/null || true)
+PR_BASE=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName' 2>/dev/null || true)
+
+info "=== Pre-merge validation ==="
+info "  PR: #$PR_NUMBER"
+info "  Title: ${PR_TITLE:-unknown}"
+info "  Branch: ${PR_BRANCH:-unknown} -> ${PR_BASE:-unknown}"
+info "  Strategy: $STRATEGY"
+info "  Delete branch: $DELETE_BRANCH"
+info ""
 
 # ---------- CI check wait ----------
 # Wait for required status checks to pass before merging.
 WAITED=0
 CI_API_FAILURES=0
 MAX_CI_API_FAILURES=3
+LAST_STATUS_SUMMARY=""
 
 while [[ $WAITED -lt $CI_TIMEOUT ]]; do
   # gh pr checks returns exit code 1 if checks are failing/pending.
@@ -119,9 +129,30 @@ while [[ $WAITED -lt $CI_TIMEOUT ]]; do
     if [[ $((PASS_COUNT + FAIL_COUNT + PENDING_COUNT)) -eq 0 ]]; then
       # No recognizable check statuses — this is an API/network error, not a check result.
       CI_API_FAILURES=$((CI_API_FAILURES + 1))
-      warn "gh pr checks returned an error (attempt $CI_API_FAILURES/$MAX_CI_API_FAILURES): $CHECK_OUTPUT"
+
+      # Classify error type for better messaging.
+      if echo "$CHECK_OUTPUT" | grep -qiE "timeout|timed out|connection|network"; then
+        warn "Network error checking CI status (attempt $CI_API_FAILURES/$MAX_CI_API_FAILURES)"
+      elif echo "$CHECK_OUTPUT" | grep -qiE "rate limit|429"; then
+        warn "GitHub API rate limit hit (attempt $CI_API_FAILURES/$MAX_CI_API_FAILURES)"
+      elif echo "$CHECK_OUTPUT" | grep -qiE "unauthorized|forbidden|401|403"; then
+        die "Authentication error: $CHECK_OUTPUT
+
+Try re-authenticating: gh auth login"
+      else
+        warn "API error checking CI status (attempt $CI_API_FAILURES/$MAX_CI_API_FAILURES): $(echo "$CHECK_OUTPUT" | head -1)"
+      fi
+
       if [[ $CI_API_FAILURES -ge $MAX_CI_API_FAILURES ]]; then
-        die "gh pr checks failed $MAX_CI_API_FAILURES times due to API errors. Cannot verify CI status. Last output: $CHECK_OUTPUT"
+        die "gh pr checks failed $MAX_CI_API_FAILURES times due to API errors. Cannot verify CI status.
+
+Last error: $CHECK_OUTPUT
+
+Troubleshooting:
+  - Check network: curl -I https://api.github.com
+  - Check auth: gh auth status
+  - View PR manually: gh pr view $PR_NUMBER --web
+  - Skip CI wait: merge-pr $PR_NUMBER --ci-timeout 0"
       fi
       sleep "$CI_POLL_INTERVAL"
       WAITED=$((WAITED + CI_POLL_INTERVAL))
@@ -133,16 +164,36 @@ while [[ $WAITED -lt $CI_TIMEOUT ]]; do
   CI_API_FAILURES=0
 
   # Count statuses — "pass", "fail", "pending".
+  PASS_COUNT=$(echo "$CHECK_OUTPUT" | grep -c "pass" || true)
   FAIL_COUNT=$(echo "$CHECK_OUTPUT" | grep -c "fail" || true)
   PENDING_COUNT=$(echo "$CHECK_OUTPUT" | grep -c "pending\|queued\|in_progress" || true)
+  TOTAL_CHECKS=$((PASS_COUNT + FAIL_COUNT + PENDING_COUNT))
+
+  # Show progress if status changed.
+  STATUS_SUMMARY="$PASS_COUNT pass, $FAIL_COUNT fail, $PENDING_COUNT pending"
+  if [[ "$STATUS_SUMMARY" != "$LAST_STATUS_SUMMARY" ]]; then
+    info "CI status: $STATUS_SUMMARY (${WAITED}s elapsed)"
+    LAST_STATUS_SUMMARY="$STATUS_SUMMARY"
+  fi
 
   if [[ "$FAIL_COUNT" -gt 0 ]]; then
+    echo "" >&2
+    echo "CI checks failed:" >&2
     echo "$CHECK_OUTPUT" >&2
-    die "PR #$PR_NUMBER has failing CI checks. Fix them before merging."
+    echo "" >&2
+    die "PR #$PR_NUMBER has $FAIL_COUNT failing CI check(s). Fix them before merging.
+
+View details: gh pr checks $PR_NUMBER
+View PR: gh pr view $PR_NUMBER --web"
   fi
 
   if [[ "$PENDING_COUNT" -eq 0 ]]; then
     # No pending, no failing — checks either passed or there are none.
+    if [[ "$TOTAL_CHECKS" -eq 0 ]]; then
+      info "No CI checks configured for this PR."
+    else
+      info "All $PASS_COUNT CI check(s) passed."
+    fi
     break
   fi
 
@@ -155,7 +206,9 @@ while [[ $WAITED -lt $CI_TIMEOUT ]]; do
 done
 
 if [[ $WAITED -ge $CI_TIMEOUT ]]; then
-  warn "CI checks did not complete within ${CI_TIMEOUT}s. Attempting merge anyway."
+  warn "CI checks did not complete within ${CI_TIMEOUT}s."
+  warn "Current status: $LAST_STATUS_SUMMARY"
+  warn "Attempting merge anyway — GitHub will block if checks are required."
 fi
 
 # ---------- merge ----------
@@ -165,15 +218,70 @@ if [[ "$DELETE_BRANCH" == true ]]; then
   DELETE_FLAG="--delete-branch"
 fi
 
-MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" $MERGE_FLAG $DELETE_FLAG 2>&1) || {
+# Retry merge operation to handle transient failures.
+MERGE_ATTEMPT=0
+MAX_MERGE_RETRIES=3
+MERGE_SUCCESS=false
+
+while [[ $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; do
+  MERGE_ATTEMPT=$((MERGE_ATTEMPT + 1))
+
+  MERGE_OUTPUT=$(gh pr merge "$PR_NUMBER" $MERGE_FLAG $DELETE_FLAG 2>&1) && {
+    MERGE_SUCCESS=true
+    break
+  }
+
+  MERGE_EXIT=$?
+
   # Check if it was merged by someone else in the meantime.
   RECHECK_STATE=$(gh pr view "$PR_NUMBER" --json state --jq '.state' 2>/dev/null || true)
   if [[ "$RECHECK_STATE" == "MERGED" ]]; then
     info "PR #$PR_NUMBER was merged concurrently."
-    exit 0
+    MERGE_SUCCESS=true
+    break
   fi
-  die "Failed to merge PR #$PR_NUMBER: $MERGE_OUTPUT"
-}
+
+  # Classify error to determine if we should retry.
+  SHOULD_RETRY=false
+  if echo "$MERGE_OUTPUT" | grep -qiE "timeout|timed out|connection|network|rate limit|502|503|504|500"; then
+    SHOULD_RETRY=true
+    warn "Transient error merging PR (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES): $(echo "$MERGE_OUTPUT" | head -1)"
+  elif echo "$MERGE_OUTPUT" | grep -qiE "required status check|review required|not mergeable|conflict"; then
+    die "Cannot merge PR #$PR_NUMBER: $MERGE_OUTPUT
+
+Common fixes:
+  - Resolve merge conflicts: gh pr view $PR_NUMBER --web
+  - Wait for required checks: gh pr checks $PR_NUMBER
+  - Request reviews: gh pr review $PR_NUMBER"
+  elif echo "$MERGE_OUTPUT" | grep -qiE "unauthorized|forbidden|401|403"; then
+    die "Permission error merging PR #$PR_NUMBER: $MERGE_OUTPUT
+
+Try re-authenticating: gh auth login"
+  else
+    # Unknown error — retry once.
+    SHOULD_RETRY=true
+    warn "Unknown error merging PR (attempt $MERGE_ATTEMPT/$MAX_MERGE_RETRIES): $(echo "$MERGE_OUTPUT" | head -1)"
+  fi
+
+  if [[ "$SHOULD_RETRY" == true && $MERGE_ATTEMPT -lt $MAX_MERGE_RETRIES ]]; then
+    MERGE_SLEEP=$((2 ** MERGE_ATTEMPT))
+    warn "Retrying in ${MERGE_SLEEP}s..."
+    sleep "$MERGE_SLEEP"
+  else
+    break
+  fi
+done
+
+if [[ "$MERGE_SUCCESS" == false ]]; then
+  die "Failed to merge PR #$PR_NUMBER after $MAX_MERGE_RETRIES attempts.
+
+Last error: $MERGE_OUTPUT
+
+Troubleshooting:
+  - View PR: gh pr view $PR_NUMBER --web
+  - Check status: gh pr view $PR_NUMBER
+  - Manual merge: gh pr merge $PR_NUMBER --$STRATEGY"
+fi
 
 info "PR #$PR_NUMBER merged successfully ($STRATEGY)."
 
