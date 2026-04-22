@@ -15,12 +15,15 @@ groups/*
 !groups/main/
 !groups/global/
 !groups/milo/
+!groups/ops/
 groups/main/*
 groups/global/*
 groups/milo/*
+groups/ops/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
 !groups/milo/CLAUDE.md
+!groups/ops/CLAUDE.md
 
 # Secrets
 *.keys.json
