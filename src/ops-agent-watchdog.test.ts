@@ -20,15 +20,25 @@ vi.mock('./dispatch-slot-backends.js', () => ({
   })),
 }));
 
+// Mock db/index for scheduled task registration
+vi.mock('./db/index.js', () => ({
+  createTask: vi.fn(),
+  getTaskById: vi.fn(() => undefined),
+  updateTaskAfterRun: vi.fn(),
+}));
+
 import { execSync } from 'child_process';
 import { getAgentRuntime } from './runtime-adapter.js';
 import { getDispatchSlotBackend } from './dispatch-slot-backends.js';
+import { createTask, getTaskById } from './db/index.js';
 import {
   detectStuckSlots,
+  ensureWatchdogTask,
   restartNanoClaw,
   runWatchdogTick,
   startOpsAgentWatchdog,
   stopOpsAgentWatchdog,
+  WATCHDOG_TASK_ID,
   _resetWatchdogState,
 } from './ops-agent-watchdog.js';
 import type { SchedulerDependencies } from './task-scheduler.js';
@@ -75,6 +85,7 @@ describe('ops-agent-watchdog', () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.clearAllMocks();
     _resetWatchdogState();
 
     fetchMock = vi.fn().mockResolvedValue(mockFetchResponse({}));
@@ -112,6 +123,9 @@ describe('ops-agent-watchdog', () => {
       recoverStaleSlots: vi.fn(async () => []),
       pruneHistory: vi.fn(() => 0),
     });
+
+    vi.mocked(getTaskById).mockReturnValue(undefined);
+    vi.mocked(createTask).mockReturnValue(true);
   });
 
   afterEach(() => {
@@ -120,13 +134,37 @@ describe('ops-agent-watchdog', () => {
     vi.unstubAllGlobals();
   });
 
+  describe('ensureWatchdogTask', () => {
+    it('creates scheduled task row when not present', () => {
+      vi.mocked(getTaskById).mockReturnValue(undefined);
+      ensureWatchdogTask();
+      expect(createTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: WATCHDOG_TASK_ID,
+          schedule_type: 'interval',
+          schedule_value: '900000',
+          status: 'active',
+        }),
+      );
+    });
+
+    it('skips creation when task row already exists', () => {
+      vi.mocked(getTaskById).mockReturnValue({
+        id: WATCHDOG_TASK_ID,
+        status: 'active',
+      } as never);
+      ensureWatchdogTask();
+      expect(createTask).not.toHaveBeenCalled();
+    });
+  });
+
   describe('detectStuckSlots', () => {
     it('returns empty when no active slots', async () => {
       const result = await detectStuckSlots();
       expect(result).toEqual([]);
     });
 
-    it('returns empty when active slots have corresponding tmux sessions', async () => {
+    it('returns empty when executing slot has matching tmux session', async () => {
       vi.mocked(getDispatchSlotBackend).mockReturnValue({
         name: 'sqlite',
         listActiveSlots: vi.fn(async () => [
@@ -146,16 +184,60 @@ describe('ops-agent-watchdog', () => {
         pruneHistory: vi.fn(() => 0),
       });
 
+      // Session matching slot 0's prefix: nanoclaw-devworker0-*
       vi.mocked(getAgentRuntime).mockReturnValue({
         ...getAgentRuntime(),
-        listSessionNames: vi.fn(() => ['nanoclaw-worker-123456']),
+        listSessionNames: vi.fn(() => ['nanoclaw-devworker0-1710000000000']),
       });
 
       const result = await detectStuckSlots();
       expect(result).toEqual([]);
     });
 
-    it('detects stuck slots when executing but no tmux sessions', async () => {
+    it('detects stuck slot when another slot has a session but this one does not', async () => {
+      vi.mocked(getDispatchSlotBackend).mockReturnValue({
+        name: 'sqlite',
+        listActiveSlots: vi.fn(async () => [
+          {
+            slotId: 1,
+            slotIndex: 0,
+            ahqTaskId: 'task-healthy',
+            state: 'executing',
+            worktreePath: null,
+          },
+          {
+            slotId: 2,
+            slotIndex: 1,
+            ahqTaskId: 'task-stuck',
+            state: 'executing',
+            worktreePath: null,
+          },
+        ]),
+        claimSlot: vi.fn(async () => null),
+        markExecuting: vi.fn(async () => {}),
+        markReleasing: vi.fn(async () => {}),
+        freeSlot: vi.fn(async () => {}),
+        recoverStaleSlots: vi.fn(async () => []),
+        pruneHistory: vi.fn(() => 0),
+      });
+
+      // Only slot 0 has a session; slot 1 does not
+      vi.mocked(getAgentRuntime).mockReturnValue({
+        ...getAgentRuntime(),
+        listSessionNames: vi.fn(() => ['nanoclaw-devworker0-1710000000000']),
+      });
+
+      const result = await detectStuckSlots();
+      expect(result).toHaveLength(1);
+      expect(result[0]).toEqual({
+        slotId: 2,
+        slotIndex: 1,
+        ahqTaskId: 'task-stuck',
+        state: 'executing',
+      });
+    });
+
+    it('detects all stuck slots when no tmux sessions exist', async () => {
       vi.mocked(getDispatchSlotBackend).mockReturnValue({
         name: 'sqlite',
         listActiveSlots: vi.fn(async () => [
@@ -235,7 +317,7 @@ describe('ops-agent-watchdog', () => {
       expect(result).toEqual([]);
     });
 
-    it('returns empty when listActiveSlots throws', async () => {
+    it('returns empty when listActiveSlots throws after retries', async () => {
       vi.mocked(getDispatchSlotBackend).mockReturnValue({
         name: 'sqlite',
         listActiveSlots: vi.fn(async () => {
@@ -249,7 +331,10 @@ describe('ops-agent-watchdog', () => {
         pruneHistory: vi.fn(() => 0),
       });
 
-      const result = await detectStuckSlots();
+      const resultPromise = detectStuckSlots();
+      // Advance timers to allow retries to complete
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
       expect(result).toEqual([]);
     });
 
@@ -486,6 +571,49 @@ describe('ops-agent-watchdog', () => {
       );
       expect(deps.sendMessage).not.toHaveBeenCalled();
     });
+
+    it('retries Agency HQ notification on transient failure', async () => {
+      vi.mocked(getDispatchSlotBackend).mockReturnValue({
+        name: 'sqlite',
+        listActiveSlots: vi.fn(async () => [
+          {
+            slotId: 1,
+            slotIndex: 0,
+            ahqTaskId: 'stuck-task-1',
+            state: 'executing',
+            worktreePath: null,
+          },
+        ]),
+        claimSlot: vi.fn(async () => null),
+        markExecuting: vi.fn(async () => {}),
+        markReleasing: vi.fn(async () => {}),
+        freeSlot: vi.fn(async () => {}),
+        recoverStaleSlots: vi.fn(async () => []),
+        pruneHistory: vi.fn(() => 0),
+      });
+
+      vi.mocked(getAgentRuntime).mockReturnValue({
+        ...getAgentRuntime(),
+        listSessionNames: vi.fn(() => []),
+      });
+
+      vi.mocked(execSync).mockReturnValue(Buffer.from(''));
+
+      // First call fails, second succeeds
+      fetchMock
+        .mockRejectedValueOnce(new Error('network error'))
+        .mockResolvedValueOnce(mockFetchResponse({}));
+
+      const deps = makeMockDeps();
+      const tickPromise = runWatchdogTick(deps, () => false);
+
+      // Advance timers to allow retry delay (1000ms base)
+      await vi.advanceTimersByTimeAsync(2_000);
+      await tickPromise;
+
+      // Should have been called twice (initial + 1 retry)
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 
   describe('lifecycle', () => {
@@ -494,6 +622,20 @@ describe('ops-agent-watchdog', () => {
       startOpsAgentWatchdog(deps, () => false);
       stopOpsAgentWatchdog();
       // No errors thrown
+    });
+
+    it('registers scheduled task row on start', () => {
+      const deps = makeMockDeps();
+      startOpsAgentWatchdog(deps, () => false);
+
+      expect(createTask).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: WATCHDOG_TASK_ID,
+          schedule_type: 'interval',
+        }),
+      );
+
+      stopOpsAgentWatchdog();
     });
 
     it('runs tick on interval', async () => {
