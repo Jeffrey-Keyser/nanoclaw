@@ -53,6 +53,7 @@ import {
 } from './agency-hq-dispatcher.js';
 import { setSubsystemState } from './subsystem-status.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { startCrashHandler, stopCrashHandler } from './crash-handler.js';
 import { startUptimeMonitor, stopUptimeMonitor } from './uptime-monitor.js';
 import { NotificationBatcher } from './notification-batcher.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
@@ -214,6 +215,11 @@ export async function initApp(): Promise<void> {
       await notificationBatcher.flushAll();
       stopUptimeMonitor();
       setSubsystemState('uptime-monitor', {
+        state: 'disabled',
+        details: 'Shutdown requested.',
+      });
+      stopCrashHandler();
+      setSubsystemState('crash-handler', {
         state: 'disabled',
         details: 'Shutdown requested.',
       });
@@ -446,6 +452,15 @@ export async function initApp(): Promise<void> {
   setSubsystemState('uptime-monitor', {
     state: 'running',
     details: 'User-service failure alerts enabled.',
+  });
+  startCrashHandler({
+    registeredGroups: () => state.registeredGroups,
+    sendMessage: schedulerDeps.sendMessage,
+    notificationBatcher,
+  });
+  setSubsystemState('crash-handler', {
+    state: 'running',
+    details: 'Automated crash recovery active.',
   });
   startHostExecWatcher();
   setSubsystemState('host-exec', {
