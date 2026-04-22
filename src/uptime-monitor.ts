@@ -133,3 +133,16 @@ export function stopUptimeMonitor(): void {
     logger.info('Uptime monitor stopped');
   }
 }
+
+/** @internal — exported for testing only */
+export function _checkServicesForTesting(
+  deps: UptimeMonitorDeps,
+): Promise<void> {
+  return checkServices(deps);
+}
+
+/** @internal — reset in-memory state for testing */
+export function _resetForTesting(): void {
+  knownFailures.clear();
+  stopUptimeMonitor();
+}
