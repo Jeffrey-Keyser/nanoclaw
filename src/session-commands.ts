@@ -16,6 +16,7 @@ export function extractSessionCommand(
   if (text === '/compact') return '/compact';
   if (text === '/clear') return '/clear';
   if (text === '/activity') return '/activity';
+  if (text === '/topology') return '/topology';
   return null;
 }
 
@@ -167,6 +168,10 @@ export async function handleSessionCommand(opts: {
     return handleActivity(cmdMsg, deps);
   }
 
+  if (command === '/topology') {
+    return handleTopology(cmdMsg, deps);
+  }
+
   // /compact: forward the literal slash command as the prompt
   return handleCompact(command, cmdMsg, deps);
 }
@@ -239,6 +244,196 @@ async function handleActivity(
     logger.error({ err }, 'Failed to fetch tool activity');
     await deps.setTyping(false);
     await deps.sendMessage('/activity failed. Could not retrieve tool events.');
+    return { handled: true, success: false };
+  }
+}
+
+/** Agent state derived from recent tool events. */
+interface AgentState {
+  name: string;
+  sessionId: string;
+  lastTool: string;
+  lastTimestamp: string;
+  toolCount: number;
+  isActive: boolean;
+  status: 'active' | 'thinking' | 'idle';
+}
+
+/**
+ * Build per-agent state from raw tool events.
+ * An agent is "active" if its last event is within `activeThresholdMs`.
+ * An agent is "thinking" if active but its last tool completed (PostToolUse).
+ */
+export function buildAgentStates(
+  events: Array<{
+    session_id: string;
+    group_folder: string;
+    tool_name: string;
+    hook_event: string;
+    timestamp: string;
+  }>,
+  activeThresholdMs: number = 60_000,
+): AgentState[] {
+  const now = Date.now();
+  const agentMap = new Map<
+    string,
+    {
+      sessionId: string;
+      lastTool: string;
+      lastTimestamp: string;
+      lastHookEvent: string;
+      toolCount: number;
+    }
+  >();
+
+  // Events are ordered DESC by timestamp, so first occurrence per group is most recent
+  for (const event of events) {
+    const key = event.group_folder;
+    const existing = agentMap.get(key);
+    if (existing) {
+      existing.toolCount++;
+    } else {
+      agentMap.set(key, {
+        sessionId: event.session_id,
+        lastTool: event.tool_name,
+        lastTimestamp: event.timestamp,
+        lastHookEvent: event.hook_event,
+        toolCount: 1,
+      });
+    }
+  }
+
+  const states: AgentState[] = [];
+  for (const [name, data] of agentMap) {
+    const elapsed = now - new Date(data.lastTimestamp).getTime();
+    const isActive = elapsed < activeThresholdMs;
+    let status: AgentState['status'] = 'idle';
+    if (isActive) {
+      // If the last event was a completed tool use, the agent is "thinking"
+      // (processing the result before the next tool call).
+      // If the last event was a failure or it's very recent, it's "active".
+      status =
+        data.lastHookEvent === 'PostToolUse' && elapsed > 5_000
+          ? 'thinking'
+          : 'active';
+    }
+
+    states.push({
+      name,
+      sessionId: data.sessionId,
+      lastTool: data.lastTool,
+      lastTimestamp: data.lastTimestamp,
+      toolCount: data.toolCount,
+      isActive,
+      status,
+    });
+  }
+
+  // Sort: active first, then by recency
+  states.sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    return (
+      new Date(b.lastTimestamp).getTime() - new Date(a.lastTimestamp).getTime()
+    );
+  });
+
+  return states;
+}
+
+/**
+ * Render agent topology as a visual text dashboard.
+ */
+export function renderTopology(agents: AgentState[]): string {
+  const statusIcon: Record<AgentState['status'], string> = {
+    active: '🟢',
+    thinking: '🟡',
+    idle: '⚫',
+  };
+  const statusLabel: Record<AgentState['status'], string> = {
+    active: 'ACTIVE',
+    thinking: 'THINKING',
+    idle: 'IDLE',
+  };
+
+  const lines: string[] = [];
+  lines.push('*Agent Topology*');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━');
+
+  const activeAgents = agents.filter((a) => a.isActive);
+  const idleAgents = agents.filter((a) => !a.isActive);
+
+  // Summary line
+  lines.push(
+    `🟢 ${activeAgents.length} active  ⚫ ${idleAgents.length} idle  📊 ${agents.length} total`,
+  );
+  lines.push('');
+
+  if (activeAgents.length > 0) {
+    lines.push('*Active Agents:*');
+    for (const agent of activeAgents) {
+      const icon = statusIcon[agent.status];
+      const label = statusLabel[agent.status];
+      const emoji = getToolEmoji(agent.lastTool);
+      const time = new Date(agent.lastTimestamp).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+
+      lines.push(`${icon} *${agent.name}* [${label}]`);
+      lines.push(`   ${emoji} ${agent.lastTool} (${time})`);
+      lines.push(`   📈 ${agent.toolCount} tool calls`);
+    }
+  }
+
+  if (idleAgents.length > 0) {
+    if (activeAgents.length > 0) lines.push('');
+    lines.push('*Idle Agents:*');
+    for (const agent of idleAgents) {
+      const time = new Date(agent.lastTimestamp).toLocaleTimeString('en-US', {
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      });
+      lines.push(`⚫ ${agent.name} — last seen ${time}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  lines.push('_/activity for event log_');
+
+  return lines.join('\n').slice(0, 3500);
+}
+
+async function handleTopology(
+  cmdMsg: NewMessage,
+  deps: SessionCommandDeps,
+): Promise<{ handled: true; success: boolean }> {
+  await deps.setTyping(true);
+
+  try {
+    const events = getRecentToolEvents(5);
+
+    if (events.length === 0) {
+      deps.advanceCursor(cmdMsg.timestamp);
+      await deps.setTyping(false);
+      await deps.sendMessage('No agent activity in the last 5 minutes.');
+      return { handled: true, success: true };
+    }
+
+    const agents = buildAgentStates(events);
+    const message = renderTopology(agents);
+
+    deps.advanceCursor(cmdMsg.timestamp);
+    await deps.setTyping(false);
+    await deps.sendMessage(message);
+
+    return { handled: true, success: true };
+  } catch (err) {
+    logger.error({ err }, 'Failed to build topology');
+    await deps.setTyping(false);
+    await deps.sendMessage('/topology failed. Could not retrieve agent state.');
     return { handled: true, success: false };
   }
 }

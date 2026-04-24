@@ -14,6 +14,8 @@ import {
   extractSessionCommand,
   handleSessionCommand,
   isSessionCommandAllowed,
+  buildAgentStates,
+  renderTopology,
 } from './session-commands.js';
 import type { NewMessage } from './types.js';
 import type { SessionCommandDeps } from './session-commands.js';
@@ -31,6 +33,14 @@ describe('extractSessionCommand', () => {
 
   it('detects bare /activity', () => {
     expect(extractSessionCommand('/activity', trigger)).toBe('/activity');
+  });
+
+  it('detects bare /topology', () => {
+    expect(extractSessionCommand('/topology', trigger)).toBe('/topology');
+  });
+
+  it('detects /topology with trigger prefix', () => {
+    expect(extractSessionCommand('@Andy /topology', trigger)).toBe('/topology');
   });
 
   it('detects /activity with trigger prefix', () => {
@@ -357,5 +367,300 @@ describe('handleSessionCommand', () => {
     expect(deps.sendMessage).toHaveBeenCalledWith(
       '/clear failed. The session is unchanged.',
     );
+  });
+
+  it('handles /topology with no events — sends empty message', async () => {
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/topology')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      'No agent activity in the last 5 minutes.',
+    );
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+    expect(deps.runAgent).not.toHaveBeenCalled();
+  });
+
+  it('handles /topology with events — sends topology dashboard', async () => {
+    const { getRecentToolEvents } = await import('./db/index.js');
+    (getRecentToolEvents as ReturnType<typeof vi.fn>).mockReturnValue([
+      {
+        session_id: 'sess-1',
+        group_folder: 'agent-alpha',
+        tool_name: 'Bash',
+        hook_event: 'PostToolUse',
+        timestamp: new Date().toISOString(),
+      },
+    ]);
+
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/topology')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: true });
+    const sentMessage = (deps.sendMessage as ReturnType<typeof vi.fn>).mock
+      .calls[0][0] as string;
+    expect(sentMessage).toContain('Agent Topology');
+    expect(sentMessage).toContain('agent-alpha');
+    expect(deps.advanceCursor).toHaveBeenCalledWith('100');
+  });
+
+  it('handles /topology error — sends failure message', async () => {
+    const { getRecentToolEvents } = await import('./db/index.js');
+    (getRecentToolEvents as ReturnType<typeof vi.fn>).mockImplementation(
+      () => {
+        throw new Error('db error');
+      },
+    );
+
+    const deps = makeDeps();
+    const result = await handleSessionCommand({
+      missedMessages: [makeMsg('/topology')],
+      isMainGroup: true,
+      groupName: 'test',
+      triggerPattern: trigger,
+      timezone: 'UTC',
+      deps,
+    });
+    expect(result).toEqual({ handled: true, success: false });
+    expect(deps.sendMessage).toHaveBeenCalledWith(
+      '/topology failed. Could not retrieve agent state.',
+    );
+
+    // Restore mock
+    (getRecentToolEvents as ReturnType<typeof vi.fn>).mockReturnValue([]);
+  });
+});
+
+describe('buildAgentStates', () => {
+  it('returns empty array for no events', () => {
+    expect(buildAgentStates([])).toEqual([]);
+  });
+
+  it('groups events by group_folder and uses most recent as last tool', () => {
+    const now = Date.now();
+    const events = [
+      {
+        session_id: 's1',
+        group_folder: 'agent-a',
+        tool_name: 'Read',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 10_000).toISOString(),
+      },
+      {
+        session_id: 's1',
+        group_folder: 'agent-a',
+        tool_name: 'Bash',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 30_000).toISOString(),
+      },
+      {
+        session_id: 's2',
+        group_folder: 'agent-b',
+        tool_name: 'Write',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 120_000).toISOString(),
+      },
+    ];
+
+    const states = buildAgentStates(events);
+    expect(states).toHaveLength(2);
+
+    // agent-a is active (10s ago), agent-b is idle (120s ago)
+    expect(states[0].name).toBe('agent-a');
+    expect(states[0].lastTool).toBe('Read'); // first event is most recent (DESC order)
+    expect(states[0].toolCount).toBe(2);
+    expect(states[0].isActive).toBe(true);
+
+    expect(states[1].name).toBe('agent-b');
+    expect(states[1].lastTool).toBe('Write');
+    expect(states[1].toolCount).toBe(1);
+    expect(states[1].isActive).toBe(false);
+    expect(states[1].status).toBe('idle');
+  });
+
+  it('marks very recent events as active (not thinking)', () => {
+    const now = Date.now();
+    const events = [
+      {
+        session_id: 's1',
+        group_folder: 'agent-a',
+        tool_name: 'Bash',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 2_000).toISOString(), // 2s ago
+      },
+    ];
+    const states = buildAgentStates(events);
+    expect(states[0].status).toBe('active');
+  });
+
+  it('marks older active events as thinking when PostToolUse', () => {
+    const now = Date.now();
+    const events = [
+      {
+        session_id: 's1',
+        group_folder: 'agent-a',
+        tool_name: 'Bash',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 15_000).toISOString(), // 15s ago
+      },
+    ];
+    const states = buildAgentStates(events);
+    expect(states[0].status).toBe('thinking');
+  });
+
+  it('sorts active agents before idle agents', () => {
+    const now = Date.now();
+    const events = [
+      {
+        session_id: 's2',
+        group_folder: 'idle-agent',
+        tool_name: 'Read',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 120_000).toISOString(),
+      },
+      {
+        session_id: 's1',
+        group_folder: 'active-agent',
+        tool_name: 'Bash',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 2_000).toISOString(),
+      },
+    ];
+    const states = buildAgentStates(events);
+    expect(states[0].name).toBe('active-agent');
+    expect(states[1].name).toBe('idle-agent');
+  });
+
+  it('respects custom activeThresholdMs', () => {
+    const now = Date.now();
+    const events = [
+      {
+        session_id: 's1',
+        group_folder: 'agent-a',
+        tool_name: 'Read',
+        hook_event: 'PostToolUse',
+        timestamp: new Date(now - 30_000).toISOString(),
+      },
+    ];
+    // 10s threshold — 30s ago is idle
+    expect(buildAgentStates(events, 10_000)[0].isActive).toBe(false);
+    // 60s threshold — 30s ago is active
+    expect(buildAgentStates(events, 60_000)[0].isActive).toBe(true);
+  });
+});
+
+describe('renderTopology', () => {
+  it('renders active and idle agents', () => {
+    const output = renderTopology([
+      {
+        name: 'builder',
+        sessionId: 's1',
+        lastTool: 'Bash',
+        lastTimestamp: new Date().toISOString(),
+        toolCount: 5,
+        isActive: true,
+        status: 'active',
+      },
+      {
+        name: 'reviewer',
+        sessionId: 's2',
+        lastTool: 'Read',
+        lastTimestamp: new Date(Date.now() - 120_000).toISOString(),
+        toolCount: 2,
+        isActive: false,
+        status: 'idle',
+      },
+    ]);
+
+    expect(output).toContain('Agent Topology');
+    expect(output).toContain('1 active');
+    expect(output).toContain('1 idle');
+    expect(output).toContain('2 total');
+    expect(output).toContain('builder');
+    expect(output).toContain('[ACTIVE]');
+    expect(output).toContain('Bash');
+    expect(output).toContain('5 tool calls');
+    expect(output).toContain('reviewer');
+    expect(output).toContain('last seen');
+    expect(output).toContain('/activity for event log');
+  });
+
+  it('shows thinking status for thinking agents', () => {
+    const output = renderTopology([
+      {
+        name: 'thinker',
+        sessionId: 's1',
+        lastTool: 'Read',
+        lastTimestamp: new Date().toISOString(),
+        toolCount: 3,
+        isActive: true,
+        status: 'thinking',
+      },
+    ]);
+    expect(output).toContain('[THINKING]');
+    expect(output).toContain('🟡');
+  });
+
+  it('stays within 3500 char limit', () => {
+    // Create many agents to test truncation
+    const agents = Array.from({ length: 100 }, (_, i) => ({
+      name: `agent-with-a-very-long-name-number-${i}`,
+      sessionId: `s${i}`,
+      lastTool: 'Bash',
+      lastTimestamp: new Date().toISOString(),
+      toolCount: 999,
+      isActive: true,
+      status: 'active' as const,
+    }));
+    const output = renderTopology(agents);
+    expect(output.length).toBeLessThanOrEqual(3500);
+  });
+
+  it('renders only idle section when no active agents', () => {
+    const output = renderTopology([
+      {
+        name: 'sleeper',
+        sessionId: 's1',
+        lastTool: 'Read',
+        lastTimestamp: new Date(Date.now() - 300_000).toISOString(),
+        toolCount: 1,
+        isActive: false,
+        status: 'idle',
+      },
+    ]);
+    expect(output).toContain('0 active');
+    expect(output).toContain('1 idle');
+    expect(output).toContain('Idle Agents:');
+    expect(output).not.toContain('Active Agents:');
+  });
+
+  it('renders only active section when no idle agents', () => {
+    const output = renderTopology([
+      {
+        name: 'worker',
+        sessionId: 's1',
+        lastTool: 'Bash',
+        lastTimestamp: new Date().toISOString(),
+        toolCount: 10,
+        isActive: true,
+        status: 'active',
+      },
+    ]);
+    expect(output).toContain('1 active');
+    expect(output).toContain('0 idle');
+    expect(output).toContain('Active Agents:');
+    expect(output).not.toContain('Idle Agents:');
   });
 });
