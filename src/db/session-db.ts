@@ -208,6 +208,49 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
 }
 
 // ---------------------------------------------------------------------------
+// tool_call_events (read-only from host)
+// ---------------------------------------------------------------------------
+
+export interface ToolCallEvent {
+  id: string;
+  tool_name: string;
+  tool_input: string | null;
+  started_at: string;
+  finished_at: string;
+  duration_ms: number | null;
+  error: string | null;
+}
+
+/**
+ * Read tool call events from a session's outbound.db. Returns events in
+ * chronological order, optionally limited to the most recent `limit`.
+ * Gracefully returns [] if the table doesn't exist (older session DBs).
+ */
+export function getToolCallEvents(outDb: Database.Database, limit?: number): ToolCallEvent[] {
+  try {
+    const sql = limit
+      ? 'SELECT * FROM tool_call_events ORDER BY started_at DESC LIMIT ?'
+      : 'SELECT * FROM tool_call_events ORDER BY started_at ASC';
+    return (limit ? outDb.prepare(sql).all(limit) : outDb.prepare(sql).all()) as ToolCallEvent[];
+  } catch {
+    // Table not present on older session DBs
+    return [];
+  }
+}
+
+/**
+ * Count tool call events in a session's outbound.db.
+ * Gracefully returns 0 if the table doesn't exist.
+ */
+export function countToolCallEvents(outDb: Database.Database): number {
+  try {
+    return (outDb.prepare('SELECT COUNT(*) AS count FROM tool_call_events').get() as { count: number }).count;
+  } catch {
+    return 0;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // messages_out (read-only from host)
 // ---------------------------------------------------------------------------
 
