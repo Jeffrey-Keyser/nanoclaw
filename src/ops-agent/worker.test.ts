@@ -158,9 +158,16 @@ describe('ops-agent/worker', () => {
       const promise = executeTask('test prompt', 5000);
 
       // Without dispatch-config, should use env default 'claude' and no --model flag
+      // Claude provider includes --output-format stream-json for StreamToolLogger
       expect(spawn).toHaveBeenCalledWith(
         'claude',
-        ['--print', '--dangerously-skip-permissions', 'test prompt'],
+        [
+          '--print',
+          '--output-format',
+          'stream-json',
+          '--dangerously-skip-permissions',
+          'test prompt',
+        ],
         expect.objectContaining({
           stdio: ['pipe', 'pipe', 'pipe'],
         }),
@@ -208,6 +215,8 @@ describe('ops-agent/worker', () => {
         'claude',
         [
           '--print',
+          '--output-format',
+          'stream-json',
           '--dangerously-skip-permissions',
           '--model',
           'claude-sonnet-4-5-20250929',
@@ -299,13 +308,15 @@ describe('ops-agent/worker', () => {
   });
 
   describe('buildCliArgs', () => {
-    it('claude: uses --print --dangerously-skip-permissions', () => {
+    it('claude: uses --print --output-format stream-json --dangerously-skip-permissions', () => {
       const args = buildCliArgs(
         { provider: 'claude', cliBin: 'claude', model: undefined },
         'do stuff',
       );
       expect(args).toEqual([
         '--print',
+        '--output-format',
+        'stream-json',
         '--dangerously-skip-permissions',
         'do stuff',
       ]);

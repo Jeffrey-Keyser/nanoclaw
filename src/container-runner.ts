@@ -120,6 +120,15 @@ export function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tool-events'), { recursive: true });
+  logger.debug(
+    {
+      groupFolder: group.folder,
+      groupIpcDir,
+      toolEventsDir: path.join(groupIpcDir, 'tool-events'),
+      claudeConfigDir: groupSessionsDir,
+    },
+    'IPC directories created for group (tool-events enabled)',
+  );
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',

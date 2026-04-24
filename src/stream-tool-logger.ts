@@ -69,6 +69,10 @@ export class StreamToolLogger {
     // Extract session ID from system/init message
     if (msg.type === 'system' && msg.subtype === 'init' && msg.session_id) {
       this.sessionId = msg.session_id;
+      logger.debug(
+        { sessionId: msg.session_id, group: this.groupFolder },
+        'StreamToolLogger: session ID extracted from init message',
+      );
     }
 
     // Track tool_use invocations
@@ -79,6 +83,10 @@ export class StreamToolLogger {
         name: msg.name,
         input: msg.input,
       });
+      logger.debug(
+        { toolId: msg.id, toolName: msg.name, group: this.groupFolder },
+        'StreamToolLogger: tracking tool_use',
+      );
     }
 
     // Log tool_result events (matches tool_use by tool_use_id)

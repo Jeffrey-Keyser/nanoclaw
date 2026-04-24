@@ -64,6 +64,15 @@ export function bootstrapSessionSettings(groupFolder: string): string {
     };
     hooks.PostToolUse = [toolObserverEntry];
     hooks.PostToolUseFailure = [toolObserverEntry];
+    logger.debug(
+      { groupFolder, toolObserverHook },
+      'Configured PostToolUse hooks for tool-observer',
+    );
+  } else {
+    logger.warn(
+      { groupFolder, toolObserverHook },
+      'tool-observer.sh not found, PostToolUse hooks will not be configured',
+    );
   }
 
   if (Object.keys(hooks).length > 0) {
@@ -163,6 +172,15 @@ export function buildSessionEnv(mounts: VolumeMount[]): Record<string, string> {
   // Provider-agnostic backend configuration
   env.AGENT_RUNNER_BACKEND = AGENT_RUNNER_BACKEND;
   env.AGENT_CLI_BIN = AGENT_CLI_BIN;
+
+  logger.debug(
+    {
+      CLAUDE_CONFIG_DIR: env.CLAUDE_CONFIG_DIR ?? '<unset>',
+      NANOCLAW_IPC_INPUT_DIR: env.NANOCLAW_IPC_INPUT_DIR ?? '<unset>',
+      NANOCLAW_GROUP_DIR: env.NANOCLAW_GROUP_DIR ?? '<unset>',
+    },
+    'Session environment built for agent',
+  );
 
   return env;
 }

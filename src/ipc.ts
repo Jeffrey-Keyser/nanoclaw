@@ -186,8 +186,28 @@ export function startIpcWatcher(deps: IpcDeps): void {
               tool_input?: string;
               tool_response?: string;
             };
+
+            log.debug(
+              {
+                hasToolName: !!event.tool_name,
+                hasSessionId: !!event.session_id,
+                hookEvent: event.hook_event,
+                toolName: event.tool_name,
+              },
+              'Processing IPC tool event file',
+            );
+
             if (!event.tool_name || !event.session_id) {
-              log.warn({ event }, 'Skipping tool event with missing fields');
+              log.warn(
+                {
+                  event: {
+                    tool_name: event.tool_name ?? '<missing>',
+                    session_id: event.session_id ?? '<missing>',
+                    hook_event: event.hook_event,
+                  },
+                },
+                'Skipping tool event with missing fields',
+              );
               return;
             }
             insertToolCallEvent({
@@ -209,7 +229,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
             });
             log.debug(
               { tool: event.tool_name, session: event.session_id },
-              'Tool event stored',
+              'Tool event stored in database',
             );
           },
         });
