@@ -8,12 +8,18 @@ vi.mock('child_process', () => ({
   spawn: vi.fn(),
 }));
 
+// Mock session-settings to avoid filesystem side effects in tests
+vi.mock('../session-settings.js', () => ({
+  bootstrapSessionSettings: vi.fn().mockReturnValue('/mock/sessions/ops/.claude'),
+}));
+
 import {
   fetchOpsTasks,
   claimTask,
   buildOpsPrompt,
   buildCliArgs,
   executeTask,
+  bootstrapOpsToolLogging,
   reportResult,
   pollTick,
   startPolling,
@@ -23,6 +29,7 @@ import {
 import { resolveConfig } from './dispatch-config.js';
 import { createCorrelationLogger } from '../logger.js';
 import { spawn } from 'child_process';
+import { bootstrapSessionSettings } from '../session-settings.js';
 
 function makeMockTask(overrides?: Partial<AgencyHqTask>): AgencyHqTask {
   return {
@@ -343,6 +350,50 @@ describe('ops-agent/worker', () => {
       const args = buildCliArgs({ provider: 'future-ai', cliBin: 'future-ai', model: undefined }, 'do stuff');
       expect(args).toContain('--print');
       expect(args).toContain('--dangerously-skip-permissions');
+    });
+  });
+
+  describe('bootstrapOpsToolLogging', () => {
+    it('returns CLAUDE_CONFIG_DIR and NANOCLAW_IPC_INPUT_DIR', () => {
+      const env = bootstrapOpsToolLogging();
+      expect(env.CLAUDE_CONFIG_DIR).toBe('/mock/sessions/ops/.claude');
+      expect(env.NANOCLAW_IPC_INPUT_DIR).toContain('ipc');
+      expect(env.NANOCLAW_IPC_INPUT_DIR).toContain('ops');
+      expect(env.NANOCLAW_IPC_INPUT_DIR).toMatch(/input$/);
+    });
+
+    it('calls bootstrapSessionSettings with ops group folder', () => {
+      bootstrapOpsToolLogging();
+      expect(bootstrapSessionSettings).toHaveBeenCalledWith('ops');
+    });
+  });
+
+  describe('executeTask tool logging', () => {
+    it('passes CLAUDE_CONFIG_DIR and NANOCLAW_IPC_INPUT_DIR to spawned process', async () => {
+      const mockProc = {
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        stdin: { end: vi.fn() },
+        on: vi.fn(),
+      };
+
+      vi.mocked(spawn).mockReturnValue(mockProc as never);
+
+      const promise = executeTask('test prompt', 5000);
+
+      // Verify env includes tool logging vars
+      const spawnCall = vi.mocked(spawn).mock.calls[0];
+      const spawnOpts = spawnCall[2] as { env: Record<string, string> };
+      expect(spawnOpts.env.CLAUDE_CONFIG_DIR).toBe('/mock/sessions/ops/.claude');
+      expect(spawnOpts.env.NANOCLAW_IPC_INPUT_DIR).toContain('ops');
+      expect(spawnOpts.env.NANOCLAW_IPC_INPUT_DIR).toMatch(/input$/);
+
+      // Simulate close
+      const closeHandler = mockProc.on.mock.calls.find(
+        (c: unknown[]) => c[0] === 'close',
+      )![1];
+      closeHandler(0);
+      await promise;
     });
   });
 

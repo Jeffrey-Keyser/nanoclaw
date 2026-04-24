@@ -11,13 +11,15 @@
  *   npx tsx src/ops-agent/worker.ts
  */
 import { execSync, spawn } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 
 import {
   agencyFetch,
   fetchPersona,
   type AgencyHqTask,
 } from '../agency-hq-client.js';
-import { AGENCY_HQ_URL, AGENT_CLI_BIN } from '../config.js';
+import { AGENCY_HQ_URL, AGENT_CLI_BIN, DATA_DIR } from '../config.js';
 import {
   getEffectiveConfig,
   startConfigPolling,
@@ -25,6 +27,7 @@ import {
   type ResolvedConfig,
   _resetForTest as _resetConfigForTest,
 } from './dispatch-config.js';
+import { bootstrapSessionSettings } from '../session-settings.js';
 import { createCorrelationLogger, logger } from '../logger.js';
 
 // --- Configuration ---
@@ -46,6 +49,29 @@ const OPS_PERSONA_KEY =
 let stopping = false;
 let pollTimer: ReturnType<typeof setTimeout> | null = null;
 let activeAbort: AbortController | null = null;
+
+/** Group folder used for ops-agent tool event IPC — must match a valid group folder name. */
+const OPS_GROUP_FOLDER = 'ops';
+
+/**
+ * Bootstrap session settings and IPC directories for ops-agent tool call logging.
+ * Returns environment variables to pass to the spawned CLI process so that
+ * PostToolUse/PostToolUseFailure hooks write events to the IPC tool-events dir.
+ */
+export function bootstrapOpsToolLogging(): Record<string, string> {
+  // Ensure IPC directories exist for the ops group
+  const ipcDir = path.join(DATA_DIR, 'ipc', OPS_GROUP_FOLDER);
+  fs.mkdirSync(path.join(ipcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(ipcDir, 'tool-events'), { recursive: true });
+
+  // Bootstrap session settings (creates .claude/settings.json with hooks)
+  const sessionDir = bootstrapSessionSettings(OPS_GROUP_FOLDER);
+
+  return {
+    CLAUDE_CONFIG_DIR: sessionDir,
+    NANOCLAW_IPC_INPUT_DIR: path.join(ipcDir, 'input'),
+  };
+}
 
 // --- Helpers ---
 
@@ -173,6 +199,10 @@ export async function executeTask(
     if (config.provider === 'copilot') {
       delete spawnEnv.GITHUB_TOKEN;
     }
+
+    // Inject tool-logging env vars so PostToolUse hooks write to the IPC directory
+    const toolLoggingEnv = bootstrapOpsToolLogging();
+    Object.assign(spawnEnv, toolLoggingEnv);
 
     const proc = spawn(config.cliBin, args, {
       stdio: ['pipe', 'pipe', 'pipe'],
