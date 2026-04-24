@@ -42,3 +42,9 @@ export {
   deletePendingApproval,
   getPendingApprovalsByAction,
 } from './sessions.js';
+export {
+  insertToolCallEvent,
+  getRecentToolEvents,
+  pruneToolEvents,
+} from './tool-events.js';
+export type { ToolCallEvent, InsertToolCallEvent } from './tool-events.js';
