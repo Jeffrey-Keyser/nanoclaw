@@ -436,18 +436,30 @@ async function buildContainerArgs(
 
   // OneCLI gateway — injects HTTPS_PROXY + certs so container API calls
   // are routed through the agent vault for credential injection.
+  let onecliApplied = false;
   try {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
     }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
     if (onecliApplied) {
       log.info('OneCLI gateway applied', { containerName });
     } else {
-      log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
+      log.warn('OneCLI gateway not applied — falling back to direct env auth', { containerName });
     }
   } catch (err) {
-    log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+    log.warn('OneCLI gateway error — falling back to direct env auth', { containerName, err });
+  }
+
+  // Fallback: pass auth token directly when OneCLI is unavailable
+  if (!onecliApplied) {
+    const oauthToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (oauthToken) {
+      args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${oauthToken}`);
+    } else if (apiKey) {
+      args.push('-e', `ANTHROPIC_API_KEY=${apiKey}`);
+    }
   }
 
   // Host gateway
