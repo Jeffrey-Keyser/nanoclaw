@@ -255,4 +255,16 @@ CREATE TABLE IF NOT EXISTS container_state (
   tool_started_at          TEXT,
   updated_at               TEXT NOT NULL
 );
+
+-- Append-only log of tool executions. Container writes on PostToolUse /
+-- PostToolUseFailure. Host reads (read-only) for /activity and /topology.
+CREATE TABLE IF NOT EXISTS tool_call_events (
+  id          TEXT PRIMARY KEY,
+  tool_name   TEXT NOT NULL,
+  tool_input  TEXT,
+  started_at  TEXT NOT NULL,
+  finished_at TEXT NOT NULL,
+  duration_ms INTEGER,
+  error       TEXT
+);
 `;

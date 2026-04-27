@@ -3,7 +3,7 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
-import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { clearContainerToolInFlight, getOutboundDb, insertToolCallEvent, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -168,15 +168,49 @@ const preToolUseHook: HookCallback = async (input) => {
   return { continue: true };
 };
 
-/** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
-const postToolUseHook: HookCallback = async () => {
-  try {
-    clearContainerToolInFlight();
-  } catch (err) {
-    log(`PostToolUse: failed to clear container_state: ${err instanceof Error ? err.message : String(err)}`);
-  }
-  return { continue: true };
-};
+/**
+ * Log tool call event and clear in-flight state on PostToolUse / PostToolUseFailure.
+ *
+ * The hook receives `tool_name` and `tool_input` on the input object (same
+ * shape as PreToolUse). We read `tool_started_at` from `container_state`
+ * (written by PreToolUse) to compute duration.
+ */
+function createPostToolUseHook(isFailure: boolean): HookCallback {
+  return async (input) => {
+    const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
+    const toolName = i.tool_name ?? 'unknown';
+
+    try {
+      // Read the start time recorded by PreToolUse before we clear it
+      const db = getOutboundDb();
+      const state = db.prepare('SELECT tool_started_at FROM container_state WHERE id = 1').get() as
+        | { tool_started_at: string | null }
+        | undefined;
+      const startedAt = state?.tool_started_at ?? new Date().toISOString();
+      const finishedAt = new Date().toISOString();
+      const durationMs = Date.parse(finishedAt) - Date.parse(startedAt);
+
+      insertToolCallEvent({
+        id: `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        toolName,
+        toolInput: i.tool_input ? JSON.stringify(i.tool_input).slice(0, 4096) : null,
+        startedAt,
+        finishedAt,
+        durationMs: Number.isFinite(durationMs) ? durationMs : null,
+        error: isFailure ? 'tool_use_failure' : null,
+      });
+    } catch (err) {
+      log(`PostToolUse: failed to log tool call event: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    try {
+      clearContainerToolInFlight();
+    } catch (err) {
+      log(`PostToolUse: failed to clear container_state: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { continue: true };
+  };
+}
 
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
@@ -282,8 +316,8 @@ export class ClaudeProvider implements AgentProvider {
         mcpServers: this.mcpServers,
         hooks: {
           PreToolUse: [{ hooks: [preToolUseHook] }],
-          PostToolUse: [{ hooks: [postToolUseHook] }],
-          PostToolUseFailure: [{ hooks: [postToolUseHook] }],
+          PostToolUse: [{ hooks: [createPostToolUseHook(false)] }],
+          PostToolUseFailure: [{ hooks: [createPostToolUseHook(true)] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
       },

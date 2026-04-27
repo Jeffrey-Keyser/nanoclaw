@@ -29,6 +29,7 @@ import {
   ensureSchema,
   openInboundDb as openInboundDbRaw,
   openOutboundDb as openOutboundDbRaw,
+  openOutboundDbWritable,
   upsertSessionRouting,
   insertMessage,
   migrateMessagesInTable,
@@ -296,7 +297,9 @@ export function writeOutboundDirect(
     content: string;
   },
 ): void {
-  const db = openOutboundDb(agentGroupId, sessionId);
+  // Open in write mode — openOutboundDb uses readonly for host reads, but
+  // this function needs to INSERT directly (command gate deny/respond).
+  const db = openOutboundDbWritable(outboundDbPath(agentGroupId, sessionId));
   try {
     db.prepare(
       `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)

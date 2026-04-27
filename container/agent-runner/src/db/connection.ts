@@ -74,6 +74,19 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
+    // tool_call_events: append-only log of every tool execution. Container
+    // writes on PostToolUse; host reads (read-only) for /activity + /topology.
+    _outbound.exec(`
+      CREATE TABLE IF NOT EXISTS tool_call_events (
+        id          TEXT PRIMARY KEY,
+        tool_name   TEXT NOT NULL,
+        tool_input  TEXT,
+        started_at  TEXT NOT NULL,
+        finished_at TEXT NOT NULL,
+        duration_ms INTEGER,
+        error       TEXT
+      );
+    `);
   }
   return _outbound;
 }
@@ -96,6 +109,36 @@ export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number
          updated_at = excluded.updated_at`,
     )
     .run(tool, declaredTimeoutMs, now, now);
+}
+
+/**
+ * Log a completed tool call to the tool_call_events table. Called on
+ * PostToolUse / PostToolUseFailure so the host can query aggregate tool
+ * usage per session for /activity and /topology.
+ */
+export function insertToolCallEvent(event: {
+  id: string;
+  toolName: string;
+  toolInput: string | null;
+  startedAt: string;
+  finishedAt: string;
+  durationMs: number | null;
+  error: string | null;
+}): void {
+  getOutboundDb()
+    .prepare(
+      `INSERT OR IGNORE INTO tool_call_events (id, tool_name, tool_input, started_at, finished_at, duration_ms, error)
+       VALUES ($id, $tool_name, $tool_input, $started_at, $finished_at, $duration_ms, $error)`,
+    )
+    .run({
+      $id: event.id,
+      $tool_name: event.toolName,
+      $tool_input: event.toolInput,
+      $started_at: event.startedAt,
+      $finished_at: event.finishedAt,
+      $duration_ms: event.durationMs,
+      $error: event.error,
+    });
 }
 
 /** Clear the in-flight tool — called on PostToolUse / PostToolUseFailure. */
@@ -211,6 +254,15 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE tool_call_events (
+      id          TEXT PRIMARY KEY,
+      tool_name   TEXT NOT NULL,
+      tool_input  TEXT,
+      started_at  TEXT NOT NULL,
+      finished_at TEXT NOT NULL,
+      duration_ms INTEGER,
+      error       TEXT
     );
   `);
 

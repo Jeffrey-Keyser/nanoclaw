@@ -420,6 +420,18 @@ async function deliverToAgent(
       log.info('Admin command denied by gate', { command: gate.command, userId, agentGroupId: agent.agent_group_id });
       return;
     }
+    if (gate.action === 'respond') {
+      writeOutboundDirect(session.agent_group_id, session.id, {
+        id: `host-cmd-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        kind: 'chat',
+        platformId: deliveryAddr.platformId,
+        channelType: deliveryAddr.channelType,
+        threadId: deliveryAddr.threadId,
+        content: JSON.stringify({ text: gate.text }),
+      });
+      log.info('Host command handled', { agentGroupId: agent.agent_group_id });
+      return;
+    }
   }
 
   writeSessionMessage(session.agent_group_id, session.id, {
