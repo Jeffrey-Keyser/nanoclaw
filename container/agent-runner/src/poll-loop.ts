@@ -1,3 +1,4 @@
+import { emitActivityEvent } from './activity-events.js';
 import { findByName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
@@ -104,6 +105,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     for (const msg of messages) {
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
+        emitActivityEvent({
+          eventType: 'decision',
+          toolName: 'session_clear',
+          payload: { summary: 'Session cleared by user', message_id: msg.id },
+        });
         continuation = undefined;
         clearContinuation(config.providerName);
         writeMessageOut({
@@ -185,6 +191,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // it so the next attempt starts fresh.
       if (continuation && config.provider.isSessionInvalid(err)) {
         log(`Stale session detected (${continuation}) — clearing for next retry`);
+        emitActivityEvent({
+          eventType: 'decision',
+          toolName: 'stale_session_recovery',
+          payload: { summary: 'Cleared stale provider session id', stale_id: continuation },
+        });
         continuation = undefined;
         clearContinuation(config.providerName);
       }

@@ -74,19 +74,34 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
-    // tool_call_events: append-only log of every tool execution. Container
-    // writes on PostToolUse; host reads (read-only) for /activity + /topology.
+    // tool_call_events: append-only log of activity events emitted by the
+    // container. Three event_type values share the table:
+    //   - tool_call_start    (PreToolUse)
+    //   - tool_call_complete (PostToolUse / PostToolUseFailure)
+    //   - decision           (runtime branch points: clear, retry, etc.)
+    // Host reads (read-only) for /activity + /topology.
     _outbound.exec(`
       CREATE TABLE IF NOT EXISTS tool_call_events (
         id          TEXT PRIMARY KEY,
-        tool_name   TEXT NOT NULL,
+        event_type  TEXT NOT NULL DEFAULT 'tool_call_complete',
+        tool_name   TEXT,
         tool_input  TEXT,
         started_at  TEXT NOT NULL,
         finished_at TEXT NOT NULL,
         duration_ms INTEGER,
         error       TEXT
       );
+      CREATE INDEX IF NOT EXISTS idx_tool_call_events_started ON tool_call_events(started_at DESC);
     `);
+    // Forward-compat ALTER for outbound.db files created before event_type
+    // existed. Old rows were all completed tool calls, so default backfills
+    // correctly.
+    const tceCols = new Set(
+      (_outbound.prepare("PRAGMA table_info('tool_call_events')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    if (!tceCols.has('event_type')) {
+      _outbound.exec(`ALTER TABLE tool_call_events ADD COLUMN event_type TEXT NOT NULL DEFAULT 'tool_call_complete'`);
+    }
   }
   return _outbound;
 }
@@ -114,7 +129,12 @@ export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number
 /**
  * Log a completed tool call to the tool_call_events table. Called on
  * PostToolUse / PostToolUseFailure so the host can query aggregate tool
- * usage per session for /activity and /topology.
+ * usage per session for /activity and /topology. Emits an event_type of
+ * 'tool_call_complete'.
+ *
+ * For new instrumentation (start events, decisions), use emitActivityEvent
+ * from ../activity-events.ts — this function is kept as the lower-level
+ * primitive that activity-events.ts also uses.
  */
 export function insertToolCallEvent(event: {
   id: string;
@@ -127,8 +147,9 @@ export function insertToolCallEvent(event: {
 }): void {
   getOutboundDb()
     .prepare(
-      `INSERT OR IGNORE INTO tool_call_events (id, tool_name, tool_input, started_at, finished_at, duration_ms, error)
-       VALUES ($id, $tool_name, $tool_input, $started_at, $finished_at, $duration_ms, $error)`,
+      `INSERT OR IGNORE INTO tool_call_events
+         (id, event_type, tool_name, tool_input, started_at, finished_at, duration_ms, error)
+       VALUES ($id, 'tool_call_complete', $tool_name, $tool_input, $started_at, $finished_at, $duration_ms, $error)`,
     )
     .run({
       $id: event.id,
@@ -257,12 +278,19 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
     );
     CREATE TABLE tool_call_events (
       id          TEXT PRIMARY KEY,
-      tool_name   TEXT NOT NULL,
+      event_type  TEXT NOT NULL DEFAULT 'tool_call_complete',
+      tool_name   TEXT,
       tool_input  TEXT,
       started_at  TEXT NOT NULL,
       finished_at TEXT NOT NULL,
       duration_ms INTEGER,
       error       TEXT
+    );
+    CREATE TABLE session_routing (
+      id           INTEGER PRIMARY KEY CHECK (id = 1),
+      channel_type TEXT,
+      platform_id  TEXT,
+      thread_id    TEXT
     );
   `);
 

@@ -3,7 +3,8 @@ import path from 'path';
 
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
-import { clearContainerToolInFlight, getOutboundDb, insertToolCallEvent, setContainerToolInFlight } from '../db/connection.js';
+import { emitActivityEvent } from '../activity-events.js';
+import { clearContainerToolInFlight, getOutboundDb, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -165,6 +166,13 @@ const preToolUseHook: HookCallback = async (input) => {
   } catch (err) {
     log(`PreToolUse: failed to record container_state: ${err instanceof Error ? err.message : String(err)}`);
   }
+  // Emit a tool_call_start activity event. emitActivityEvent is fail-soft —
+  // any DB error is logged and swallowed so tool execution proceeds.
+  emitActivityEvent({
+    eventType: 'tool_call_start',
+    toolName,
+    payload: i.tool_input ? (i.tool_input as Record<string, unknown>) : null,
+  });
   return { continue: true };
 };
 
@@ -180,28 +188,30 @@ function createPostToolUseHook(isFailure: boolean): HookCallback {
     const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
     const toolName = i.tool_name ?? 'unknown';
 
+    let startedAt = new Date().toISOString();
     try {
-      // Read the start time recorded by PreToolUse before we clear it
+      // Read the start time recorded by PreToolUse so duration_ms is accurate.
       const db = getOutboundDb();
       const state = db.prepare('SELECT tool_started_at FROM container_state WHERE id = 1').get() as
         | { tool_started_at: string | null }
         | undefined;
-      const startedAt = state?.tool_started_at ?? new Date().toISOString();
-      const finishedAt = new Date().toISOString();
-      const durationMs = Date.parse(finishedAt) - Date.parse(startedAt);
-
-      insertToolCallEvent({
-        id: `tc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        toolName,
-        toolInput: i.tool_input ? JSON.stringify(i.tool_input).slice(0, 4096) : null,
-        startedAt,
-        finishedAt,
-        durationMs: Number.isFinite(durationMs) ? durationMs : null,
-        error: isFailure ? 'tool_use_failure' : null,
-      });
+      if (state?.tool_started_at) startedAt = state.tool_started_at;
     } catch (err) {
-      log(`PostToolUse: failed to log tool call event: ${err instanceof Error ? err.message : String(err)}`);
+      log(`PostToolUse: failed to read start time: ${err instanceof Error ? err.message : String(err)}`);
     }
+
+    const finishedAt = new Date().toISOString();
+    const durationMs = Date.parse(finishedAt) - Date.parse(startedAt);
+
+    emitActivityEvent({
+      eventType: 'tool_call_complete',
+      toolName,
+      payload: i.tool_input ? (i.tool_input as Record<string, unknown>) : null,
+      startedAt,
+      finishedAt,
+      durationMs: Number.isFinite(durationMs) ? durationMs : null,
+      error: isFailure ? 'tool_use_failure' : null,
+    });
 
     try {
       clearContainerToolInFlight();
