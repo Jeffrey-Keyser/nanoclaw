@@ -10,6 +10,7 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import {
+  ACTIVITY_AUTO_STREAM,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
@@ -426,6 +427,13 @@ async function buildContainerArgs(
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
+  // Optional opt-in: when set, the container's activity-events helper
+  // broadcasts tool_call_start + decision events as chat messages on the
+  // session's default routing. Default off (no env var pushed). Read in
+  // container/agent-runner/src/activity-events.ts.
+  if (ACTIVITY_AUTO_STREAM) {
+    args.push('-e', 'ACTIVITY_AUTO_STREAM=true');
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

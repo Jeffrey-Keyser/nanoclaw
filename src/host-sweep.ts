@@ -29,6 +29,7 @@
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 
+import { runRetentionForSession } from './activity-cleanup.js';
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -184,6 +185,14 @@ async function sweepSession(session: Session): Promise<void> {
     // skips messages already scheduled for a future retry.
     if (!alive && outDb) {
       resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+    }
+
+    // 4b. Activity-event retention. Container is the sole writer of
+    // outbound.db's tool_call_events; only safe to DELETE host-side when
+    // the container is stopped. Cheap idempotent check — runs every sweep
+    // but most sessions delete nothing.
+    if (!alive) {
+      runRetentionForSession(agentGroup.id, session.id);
     }
 
     // 5. Recurrence fanout for completed recurring tasks.

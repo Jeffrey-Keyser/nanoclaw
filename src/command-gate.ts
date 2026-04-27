@@ -13,7 +13,7 @@ import { getDb, hasTable } from './db/connection.js';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { countToolCallEvents, getToolCallEvents } from './db/session-db.js';
+import { countToolCallEvents, getToolCallEvents, type ToolCallEvent } from './db/session-db.js';
 import { openOutboundDb } from './session-manager.js';
 import { isContainerRunning } from './container-runner.js';
 
@@ -46,7 +46,8 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
 
   if (!text.startsWith('/')) return { action: 'pass' };
 
-  const command = text.split(/\s/)[0].toLowerCase();
+  const tokens = text.split(/\s+/);
+  const command = tokens[0].toLowerCase();
 
   if (FILTERED_COMMANDS.has(command)) return { action: 'filter' };
 
@@ -54,7 +55,7 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
     if (!isAdmin(userId, agentGroupId)) {
       return { action: 'deny', command };
     }
-    return { action: 'respond', text: handleHostCommand(command) };
+    return { action: 'respond', text: handleHostCommand(command, tokens.slice(1)) };
   }
 
   if (ADMIN_COMMANDS.has(command)) {
@@ -84,10 +85,10 @@ function isAdmin(userId: string | null, agentGroupId: string): boolean {
   return row != null;
 }
 
-function handleHostCommand(command: string): string {
+function handleHostCommand(command: string, args: string[]): string {
   switch (command) {
     case '/activity':
-      return buildActivityReport();
+      return buildActivityReport(parseActivityArgs(args));
     case '/topology':
       return buildTopologyReport();
     default:
@@ -95,15 +96,64 @@ function handleHostCommand(command: string): string {
   }
 }
 
-function buildActivityReport(): string {
-  const sessions = getActiveSessions();
-  if (sessions.length === 0) return 'No active sessions.';
+const DEFAULT_ACTIVITY_MINUTES = 15;
+const MAX_ACTIVITY_MINUTES = 1440;
+/** Hard cap on event lines per response — Telegram messages cap at ~4096 chars. */
+const MAX_EVENT_LINES = 200;
 
-  const lines: string[] = ['**Agent Activity Report**', ''];
+export interface ActivityArgs {
+  /** Optional substring to filter agent group name (case-insensitive). */
+  filter: string | null;
+  /** Time window in minutes. Always within [1, MAX_ACTIVITY_MINUTES]. */
+  minutes: number;
+}
+
+/**
+ * Parse `/activity` arguments. Accepts:
+ *   /activity                   — all sessions, default window
+ *   /activity 30                — all sessions, 30-min window
+ *   /activity my-agent          — sessions whose name contains "my-agent",
+ *                                 default window
+ *   /activity my-agent 30       — both
+ *
+ * Numeric args are clamped to [1, MAX_ACTIVITY_MINUTES] (1440 = one day).
+ * The original task spec used `[ceo|ops]` for a role filter; this codebase
+ * has agent groups instead of fixed roles, so the filter accepts any
+ * substring of the agent group name.
+ */
+export function parseActivityArgs(args: string[]): ActivityArgs {
+  let filter: string | null = null;
+  let minutes = DEFAULT_ACTIVITY_MINUTES;
+
+  for (const arg of args) {
+    if (!arg) continue;
+    const asNum = Number(arg);
+    if (Number.isFinite(asNum) && Number.isInteger(asNum)) {
+      minutes = Math.max(1, Math.min(MAX_ACTIVITY_MINUTES, asNum));
+    } else if (filter === null) {
+      filter = arg.toLowerCase();
+    }
+  }
+
+  return { filter, minutes };
+}
+
+function buildActivityReport(args: ActivityArgs): string {
+  const { filter, minutes } = args;
+  const sessions = getActiveSessions();
+  if (sessions.length === 0) {
+    return `No active sessions in the last ${minutes}m.`;
+  }
+
+  const sinceIso = new Date(Date.now() - minutes * 60_000).toISOString();
+  const sections: string[] = [];
+  let totalEvents = 0;
 
   for (const session of sessions) {
     const agentGroup = getAgentGroup(session.agent_group_id);
     const name = agentGroup?.name ?? session.agent_group_id;
+
+    if (filter && !name.toLowerCase().includes(filter)) continue;
 
     let outDb;
     try {
@@ -113,23 +163,52 @@ function buildActivityReport(): string {
     }
 
     try {
-      const count = countToolCallEvents(outDb);
-      if (count === 0) continue;
+      const events = getToolCallEvents(outDb, { sinceIso });
+      if (events.length === 0) continue;
 
-      const recent = getToolCallEvents(outDb, 5);
-      lines.push(`**${name}** (session: \`${session.id.slice(0, 12)}\`) — ${count} tool calls`);
-      for (const ev of recent) {
-        const dur = ev.duration_ms != null ? `${ev.duration_ms}ms` : '?';
-        const err = ev.error ? ` [error]` : '';
-        lines.push(`  • ${ev.tool_name} (${dur})${err} — ${ev.started_at}`);
+      const remaining = MAX_EVENT_LINES - totalEvents;
+      if (remaining <= 0) {
+        sections.push(`(More events truncated — narrow the window or filter to see them.)`);
+        break;
       }
-      lines.push('');
+      const slice = events.slice(0, remaining);
+      totalEvents += slice.length;
+
+      const lines: string[] = [`**${name}** (session: \`${session.id.slice(0, 12)}\`) — ${events.length} event(s)`];
+      for (const ev of slice) lines.push(`  • ${formatEvent(ev)}`);
+      if (slice.length < events.length) {
+        lines.push(`  …(+${events.length - slice.length} more)`);
+      }
+      sections.push(lines.join('\n'));
     } finally {
       outDb.close();
     }
   }
 
-  return lines.length <= 2 ? 'No tool call activity recorded yet.' : lines.join('\n');
+  if (sections.length === 0) {
+    const scope = filter ? ` matching "${filter}"` : '';
+    return `No recent activity${scope} in the last ${minutes}m.`;
+  }
+
+  return [`**Agent Activity** (last ${minutes}m)`, '', ...sections].join('\n\n').trimEnd();
+}
+
+/**
+ * Format one event line. Exported for testing the chronological-order +
+ * formatting contract without a live DB.
+ */
+export function formatEvent(ev: ToolCallEvent): string {
+  const time = ev.started_at;
+  const tool = ev.tool_name ?? 'unknown';
+  if (ev.event_type === 'decision') {
+    return `[${time}] decision: ${tool}`;
+  }
+  if (ev.event_type === 'tool_call_start') {
+    return `[${time}] start: ${tool}`;
+  }
+  const dur = ev.duration_ms != null ? ` (${ev.duration_ms}ms)` : '';
+  const err = ev.error ? ` [error]` : '';
+  return `[${time}] complete: ${tool}${dur}${err}`;
 }
 
 function buildTopologyReport(): string {

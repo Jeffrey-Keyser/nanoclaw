@@ -256,15 +256,22 @@ CREATE TABLE IF NOT EXISTS container_state (
   updated_at               TEXT NOT NULL
 );
 
--- Append-only log of tool executions. Container writes on PostToolUse /
--- PostToolUseFailure. Host reads (read-only) for /activity and /topology.
+-- Append-only log of activity events emitted by the container. Three
+-- event_type values share the table:
+--   - tool_call_start    (PreToolUse)
+--   - tool_call_complete (PostToolUse / PostToolUseFailure)
+--   - decision           (runtime branch points: clear, retry, etc.)
+-- Container writes via container/agent-runner/src/activity-events.ts.
+-- Host reads (read-only) for /activity and /topology.
 CREATE TABLE IF NOT EXISTS tool_call_events (
   id          TEXT PRIMARY KEY,
-  tool_name   TEXT NOT NULL,
+  event_type  TEXT NOT NULL DEFAULT 'tool_call_complete',
+  tool_name   TEXT,
   tool_input  TEXT,
   started_at  TEXT NOT NULL,
   finished_at TEXT NOT NULL,
   duration_ms INTEGER,
   error       TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_tool_call_events_started ON tool_call_events(started_at DESC);
 `;

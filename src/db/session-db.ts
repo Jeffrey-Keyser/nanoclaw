@@ -219,9 +219,12 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
 // tool_call_events (read-only from host)
 // ---------------------------------------------------------------------------
 
+export type ActivityEventType = 'tool_call_start' | 'tool_call_complete' | 'decision';
+
 export interface ToolCallEvent {
   id: string;
-  tool_name: string;
+  event_type: ActivityEventType;
+  tool_name: string | null;
   tool_input: string | null;
   started_at: string;
   finished_at: string;
@@ -229,17 +232,51 @@ export interface ToolCallEvent {
   error: string | null;
 }
 
+export interface ToolCallEventQuery {
+  /** If set, return at most this many rows (most recent first). */
+  limit?: number;
+  /** If set, only return rows with started_at >= this ISO timestamp. */
+  sinceIso?: string;
+}
+
 /**
- * Read tool call events from a session's outbound.db. Returns events in
- * chronological order, optionally limited to the most recent `limit`.
+ * Read tool call events from a session's outbound.db.
+ *
+ * - Default ordering is chronological ASC (oldest first) — matches the
+ *   /activity command's "show me a timeline" use case.
+ * - When `limit` is set, the underlying query takes the most recent N
+ *   rows then re-sorts ASC so the caller still gets a chronological slice.
+ * - `sinceIso` filters to events emitted at or after the given ISO timestamp.
+ * - event_type defaults to 'tool_call_complete' for older rows that
+ *   pre-date the column, so the column is always populated on read.
+ *
  * Gracefully returns [] if the table doesn't exist (older session DBs).
  */
-export function getToolCallEvents(outDb: Database.Database, limit?: number): ToolCallEvent[] {
+export function getToolCallEvents(outDb: Database.Database, query: ToolCallEventQuery = {}): ToolCallEvent[] {
+  const { limit, sinceIso } = query;
   try {
+    // ISO-8601 strings sort lexicographically the same way they sort
+    // chronologically, so a plain `>=` comparison is correct without a
+    // datetime() cast (which would normalize the cutoff to the
+    // space-separated SQLite form and collate wrong against the
+    // T-separated stored values).
+    const where = sinceIso ? 'WHERE started_at >= ?' : '';
+    const params: unknown[] = sinceIso ? [sinceIso] : [];
     const sql = limit
-      ? 'SELECT * FROM tool_call_events ORDER BY started_at DESC LIMIT ?'
-      : 'SELECT * FROM tool_call_events ORDER BY started_at ASC';
-    return (limit ? outDb.prepare(sql).all(limit) : outDb.prepare(sql).all()) as ToolCallEvent[];
+      ? `SELECT id,
+                COALESCE(event_type, 'tool_call_complete') AS event_type,
+                tool_name, tool_input, started_at, finished_at, duration_ms, error
+         FROM tool_call_events ${where} ORDER BY started_at DESC LIMIT ?`
+      : `SELECT id,
+                COALESCE(event_type, 'tool_call_complete') AS event_type,
+                tool_name, tool_input, started_at, finished_at, duration_ms, error
+         FROM tool_call_events ${where} ORDER BY started_at ASC`;
+    if (limit) params.push(limit);
+    const rows = outDb.prepare(sql).all(...params) as ToolCallEvent[];
+    // Limited query is DESC for "most recent N" — re-sort ASC to give callers
+    // a chronological slice without an extra round-trip.
+    if (limit) rows.reverse();
+    return rows;
   } catch {
     // Table not present on older session DBs
     return [];
@@ -253,6 +290,21 @@ export function getToolCallEvents(outDb: Database.Database, limit?: number): Too
 export function countToolCallEvents(outDb: Database.Database): number {
   try {
     return (outDb.prepare('SELECT COUNT(*) AS count FROM tool_call_events').get() as { count: number }).count;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * Delete tool_call_events older than `olderThanIso`. Returns the number of
+ * rows removed. Caller is responsible for opening the outbound.db with a
+ * writable handle and ensuring the container is not running (single-writer
+ * invariant on the cross-mount file).
+ */
+export function deleteOldToolCallEvents(outDb: Database.Database, olderThanIso: string): number {
+  try {
+    const result = outDb.prepare('DELETE FROM tool_call_events WHERE started_at < ?').run(olderThanIso);
+    return Number(result.changes ?? 0);
   } catch {
     return 0;
   }
