@@ -21,6 +21,8 @@ import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
+import { ActivityEventLogger } from './modules/activity-events/index.js';
+import { getDb, hasTable } from './db/connection.js';
 import {
   createMessagingGroup,
   getMessagingGroupAgents,
@@ -444,6 +446,19 @@ async function deliverToAgent(
     content: event.message.content,
     trigger: wake ? 1 : 0,
   });
+
+  // Decision event: visible "router picked this agent" point in the
+  // activity stream. Sweep migrations run before any inbound is routed,
+  // but the table-existence check keeps test harnesses that build raw
+  // databases without migrations from blowing up here.
+  if (hasTable(getDb(), 'activity_events')) {
+    new ActivityEventLogger(getDb()).recordDecision(session.id, agentGroup.name ?? agentGroup.id, {
+      summary: `routed: ${event.channelType} → ${agentGroup.name ?? agentGroup.id}`,
+      engage_mode: agent.engage_mode,
+      wake,
+      messaging_group_id: mg.id,
+    });
+  }
 
   log.info('Message routed', {
     sessionId: session.id,

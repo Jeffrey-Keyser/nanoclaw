@@ -13,9 +13,15 @@ import { getDb, hasTable } from './db/connection.js';
 
 import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { countToolCallEvents, getToolCallEvents } from './db/session-db.js';
+import { countToolCallEvents } from './db/session-db.js';
 import { openOutboundDb } from './session-manager.js';
 import { isContainerRunning } from './container-runner.js';
+import {
+  ActivityEventLogger,
+  ACTIVITY_OUTPUT_CAP,
+  ACTIVITY_USAGE,
+  renderActivityStream,
+} from './modules/activity-events/index.js';
 
 export type GateResult =
   | { action: 'pass' }
@@ -54,7 +60,7 @@ export function gateCommand(content: string, userId: string | null, agentGroupId
     if (!isAdmin(userId, agentGroupId)) {
       return { action: 'deny', command };
     }
-    return { action: 'respond', text: handleHostCommand(command) };
+    return { action: 'respond', text: handleHostCommand(command, text, agentGroupId) };
   }
 
   if (ADMIN_COMMANDS.has(command)) {
@@ -84,10 +90,10 @@ function isAdmin(userId: string | null, agentGroupId: string): boolean {
   return row != null;
 }
 
-function handleHostCommand(command: string): string {
+function handleHostCommand(command: string, fullText: string, callingAgentGroupId: string): string {
   switch (command) {
     case '/activity':
-      return buildActivityReport();
+      return runActivityCommand(fullText, callingAgentGroupId);
     case '/topology':
       return buildTopologyReport();
     default:
@@ -95,41 +101,74 @@ function handleHostCommand(command: string): string {
   }
 }
 
-function buildActivityReport(): string {
-  const sessions = getActiveSessions();
-  if (sessions.length === 0) return 'No active sessions.';
+interface ParsedActivityArgs {
+  agent: string;
+  sinceMinutes: number;
+}
 
-  const lines: string[] = ['**Agent Activity Report**', ''];
+/**
+ * Parse `/activity [agent] [minutes]`. Returns null on malformed input
+ * (extra args, non-numeric minutes, negative minutes). Calling agent's
+ * own name is used when no agent is specified.
+ */
+export function parseActivityArgs(rest: string[], fallbackAgent: string): ParsedActivityArgs | null {
+  if (rest.length > 2) return null;
+  let agent = fallbackAgent;
+  let minutes = 30;
 
-  for (const session of sessions) {
-    const agentGroup = getAgentGroup(session.agent_group_id);
-    const name = agentGroup?.name ?? session.agent_group_id;
-
-    let outDb;
-    try {
-      outDb = openOutboundDb(session.agent_group_id, session.id);
-    } catch {
-      continue;
-    }
-
-    try {
-      const count = countToolCallEvents(outDb);
-      if (count === 0) continue;
-
-      const recent = getToolCallEvents(outDb, 5);
-      lines.push(`**${name}** (session: \`${session.id.slice(0, 12)}\`) — ${count} tool calls`);
-      for (const ev of recent) {
-        const dur = ev.duration_ms != null ? `${ev.duration_ms}ms` : '?';
-        const err = ev.error ? ` [error]` : '';
-        lines.push(`  • ${ev.tool_name} (${dur})${err} — ${ev.started_at}`);
-      }
-      lines.push('');
-    } finally {
-      outDb.close();
-    }
+  if (rest.length === 0) {
+    return { agent, sinceMinutes: minutes };
   }
 
-  return lines.length <= 2 ? 'No tool call activity recorded yet.' : lines.join('\n');
+  // Anything looking like a leading-sign number is treated as an
+  // attempted-but-malformed minutes argument, not a clever agent name.
+  const looksNumeric = (s: string): boolean => /^-?\d+$/.test(s);
+
+  if (rest.length === 1 && looksNumeric(rest[0]!)) {
+    const m = Number(rest[0]);
+    if (!Number.isFinite(m) || m <= 0) return null;
+    return { agent, sinceMinutes: m };
+  }
+
+  // Heuristic: first arg is the agent name. Reject obviously bad tokens
+  // (leading '-', empty) before accepting it.
+  if (rest[0]!.startsWith('-') || rest[0]!.length === 0) return null;
+  agent = rest[0]!;
+
+  if (rest.length === 2) {
+    if (!looksNumeric(rest[1]!)) return null;
+    const m = Number(rest[1]);
+    if (!Number.isFinite(m) || m <= 0) return null;
+    minutes = m;
+  }
+  return { agent, sinceMinutes: minutes };
+}
+
+function runActivityCommand(fullText: string, callingAgentGroupId: string): string {
+  const tokens = fullText.split(/\s+/).filter((t) => t.length > 0);
+  const rest = tokens.slice(1); // drop "/activity"
+
+  const callingAgent = getAgentGroup(callingAgentGroupId);
+  const fallback = callingAgent?.name ?? callingAgentGroupId;
+
+  const parsed = parseActivityArgs(rest, fallback);
+  if (!parsed) return ACTIVITY_USAGE;
+
+  const agentArg = parsed.agent;
+  const queryAgent = agentArg.toLowerCase() === 'all' ? '*' : agentArg;
+  const sinceMinutes = parsed.sinceMinutes;
+
+  const logger = new ActivityEventLogger(getDb());
+  // Pull one extra row so we can detect truncation.
+  const fetched = logger.queryRecent(queryAgent, sinceMinutes, ACTIVITY_OUTPUT_CAP + 1);
+  const truncated = fetched.length > ACTIVITY_OUTPUT_CAP;
+  const rows = truncated ? fetched.slice(0, ACTIVITY_OUTPUT_CAP) : fetched;
+
+  return renderActivityStream(rows, {
+    agentLabel: agentArg,
+    sinceMinutes,
+    totalAvailable: truncated ? fetched.length : rows.length,
+  });
 }
 
 function buildTopologyReport(): string {

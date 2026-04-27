@@ -13,6 +13,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startActivityEventsPoll, stopActivityEventsPoll } from './modules/activity-events/poll.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 
@@ -159,6 +160,11 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
+  // 7. Start activity-events background poll (mirrors per-session tool calls
+  // into central activity_events; runs retention sweep periodically).
+  startActivityEventsPoll();
+  log.info('Activity-events poll started');
+
   log.info('NanoClaw running');
 }
 
@@ -174,6 +180,7 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  stopActivityEventsPoll();
   await teardownChannelAdapters();
   process.exit(0);
 }
