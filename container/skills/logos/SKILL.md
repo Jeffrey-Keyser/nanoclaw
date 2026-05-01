@@ -1,6 +1,6 @@
 ---
 name: logos
-description: Surface new Logos proposals to the user via Telegram and route approve/reject/comment replies back to the Logos API. Use when a `logos.proposal.created` event arrives on RabbitMQ exchange `logos.events`, or when an incoming Telegram message matches the `approve <id>` / `reject <id> <reason>` / `comment <id> <text>` reply grammar.
+description: Surface new Logos proposals + scheduled digests to the user via Telegram and route approve/reject/comment replies back to the Logos API. Use when a `logos.proposal.created` or `logos.digest.ready` event arrives on RabbitMQ exchange `logos.events`, or when an incoming Telegram message matches the `approve <id>` / `reject <id> <reason>` / `comment <id> <text>` reply grammar.
 allowed-tools: Bash(curl:*), Bash(rabbitmqadmin:*), Bash(jq:*)
 ---
 
@@ -12,7 +12,8 @@ Logos publishes proposal lifecycle events on the `logos.events` topic exchange (
 
 ```
 RabbitMQ exchange:  logos.events            (topic, durable)
-Routing key (in):   logos.proposal.created
+Routing keys (in):  logos.proposal.created  (per-proposal nudge)
+                    logos.digest.ready      (Phase 4.4 daily digest)
 Logos base URL:     https://logos.jeffreykeyser.net
 Auth:               Authorization: Bearer ${LOGOS_SERVICE_TOKEN}
 Endpoints:
@@ -47,6 +48,30 @@ Source of truth: `LogosProposalCreatedEvent` in `@jeffrey-keyser/message-contrac
    ```
 
    Example: `New Logos proposal: update_page on example-domain. Reply ` + backtick + `approve 1a2b3c4d` + backtick + `…`
+
+## Daily digest event (`logos.digest.ready`)
+
+Phase 4.4 introduced a second consumed routing key on the same exchange.
+The cron job `logos.proposals.digest` (daily at 09:00 CST / 15:00 UTC)
+publishes a single message that is already formatted for human reading:
+
+```json
+{ "message": "Pending Logos proposals (3):\n1a2b3c4d update_page example-domain\n..." }
+```
+
+When `kind === 'logos.digest.ready'` (you can branch on the routing key
+the host-side router hands you, or on the payload shape — `digest.ready`
+events have only a `message` string), forward `payload.message` directly
+to Telegram via `send_message`. Do not parse, paraphrase, or trim it. If
+the day has no pending proposals, Logos sends the literal string
+`No pending Logos proposals.` — pass that through unchanged so the user
+gets a positive "all clear" nudge.
+
+This event is fire-and-forget. Do not call back into Logos. Do not
+persist a short-id mapping (the message text already lists short-ids;
+the per-proposal `logos.proposal.created` flow is what populates the
+mapping). No reply parsing applies — `approve N` / `reject N` only act
+on per-proposal nudges.
 
 ## Reply parsing
 
@@ -146,4 +171,4 @@ The shared consumer queue `logos.events.consumer` belongs to Logos itself — do
 - Threading state across multiple proposals (no "active proposal" — every reply must include the short-id).
 - Durable consumer queue owned by NanoClaw. The host-side router or a temp queue is enough for v1.
 - Backfill of historical proposals.
-- Other routing keys on `logos.events` (`ingest.completed`, `proposal.applied`, etc.).
+- Other routing keys on `logos.events` (`ingest.completed`, `proposal.applied`, etc.). `logos.digest.ready` (Phase 4.4) is in scope — see "Daily digest event" above.
