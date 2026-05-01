@@ -131,7 +131,7 @@ Use `jq -n --arg` to JSON-escape user input — never concatenate raw user text 
 
 Routing key: `logos.digest.ready` · Exchange: `logos.events` (topic, durable) · Frequency: daily at 15:00 UTC (09:00 CST).
 
-Digest body is precomputed by Logos — pending proposals listed as short-id (first 8 hex), kind, and page slug, or the literal `No pending Logos proposals.` when the queue is empty. Field is snake_case to match the wire format. No other fields are emitted; do not assume future enrichment.
+Digest body is precomputed by Logos — pending proposals listed as short-id (first 8 hex), kind, and page slug, or the literal `No pending Logos proposals.` when the queue is empty. No other fields are emitted; do not assume future enrichment.
 
 ## What to do when an event arrives
 
