@@ -121,27 +121,21 @@ Use `jq -n --arg` to JSON-escape user input — never concatenate raw user text 
 
 **No retries.** A single attempt is the whole story for this surface. If the user wants to try again they can re-send the reply.
 
-## Digest ready event (`logos.digest.ready`)
-
-Logos publishes a daily proposals digest at 15:00 UTC (09:00 CST) on the same `logos.events` topic exchange. The digest body is precomputed by Logos — pending proposals listed as short-id (first 8 hex), kind, and page slug, or the literal `No pending Logos proposals.` when the queue is empty.
-
-Routing key: `logos.digest.ready` · Exchange: `logos.events` (topic, durable) · Frequency: daily at 15:00 UTC (09:00 CST).
-
-### Event payload
+## Event payload (`logos.digest.ready`)
 
 ```json
 {
-  "message": "<digest text>"
+  "message": string
 }
 ```
 
-Field is snake_case to match the wire format. No other fields are emitted; do not assume future enrichment.
+Routing key: `logos.digest.ready` · Exchange: `logos.events` (topic, durable) · Frequency: daily at 15:00 UTC (09:00 CST).
 
-### What to do when an event arrives
+Digest body is precomputed by Logos — pending proposals listed as short-id (first 8 hex), kind, and page slug, or the literal `No pending Logos proposals.` when the queue is empty. Field is snake_case to match the wire format. No other fields are emitted; do not assume future enrichment.
 
-Forward `message` to Telegram **verbatim** via your `send_message` destination — no reformatting, no enrichment, no truncation, no reply prompt appended. Logos owns the wording. One message per event; no retries; no reply path back to Logos for this event (the digest is notify-only — replies, if any, fall through to the normal conversational path).
+## What to do when an event arrives
 
-### Smoke
+When the routing key is `logos.digest.ready`, forward `message` to Telegram **verbatim** via your `send_message` destination — no reformatting, no enrichment, no truncation, and no reply prompt appended. Logos owns the wording. One message per event; no retries; no reply path back to Logos for this event (the digest is notify-only — replies, if any, fall through to the normal conversational path).
 
 Same `rabbitmqadmin` pattern as `logos.proposal.created` (see "Subscribing to the exchange" below) — just swap the routing key + payload:
 
