@@ -1,18 +1,19 @@
 ---
 name: logos
-description: Surface new Logos proposals to the user via Telegram and route approve/reject/comment replies back to the Logos API. Use when a `logos.proposal.created` event arrives on RabbitMQ exchange `logos.events`, or when an incoming Telegram message matches the `approve <id>` / `reject <id> <reason>` / `comment <id> <text>` reply grammar.
+description: Surface new Logos proposals and the daily proposals digest to the user via Telegram, and route approve/reject/comment replies back to the Logos API. Use when a `logos.proposal.created` or `logos.digest.ready` event arrives on RabbitMQ exchange `logos.events`, or when an incoming Telegram message matches the `approve <id>` / `reject <id> <reason>` / `comment <id> <text>` reply grammar.
 allowed-tools: Bash(curl:*), Bash(rabbitmqadmin:*), Bash(jq:*)
 ---
 
-# Logos Proposal Push + Reply
+# Logos Proposal Push + Reply + Daily Digest
 
-Logos publishes proposal lifecycle events on the `logos.events` topic exchange (RabbitMQ). This skill turns one of those events — `logos.proposal.created` — into a Telegram nudge and routes the user's reply back to the Logos HTTP API.
+Logos publishes proposal lifecycle events on the `logos.events` topic exchange (RabbitMQ). This skill turns two of those events — `logos.proposal.created` and `logos.digest.ready` — into Telegram nudges, and routes the user's reply on a proposal back to the Logos HTTP API.
 
 ## Endpoints + constants
 
 ```
 RabbitMQ exchange:  logos.events            (topic, durable)
-Routing key (in):   logos.proposal.created
+Routing keys (in):  logos.proposal.created
+                    logos.digest.ready
 Logos base URL:     https://logos.jeffreykeyser.net
 Auth:               Authorization: Bearer ${LOGOS_SERVICE_TOKEN}
 Endpoints:
@@ -33,7 +34,7 @@ Endpoints:
 }
 ```
 
-Source of truth: `LogosProposalCreatedEvent` in `@jeffrey-keyser/message-contracts/dist/logos/events.d.ts`. Field names are snake_case to match the wire format. Other Logos events on the same exchange (`logos.ingest.completed`, `logos.proposal.applied`, etc.) are out of scope here — ignore everything except `logos.proposal.created`.
+Source of truth: `LogosProposalCreatedEvent` in `@jeffrey-keyser/message-contracts/dist/logos/events.d.ts`. Field names are snake_case to match the wire format. The daily digest event (`logos.digest.ready`) has its own section below; everything else on this exchange (`logos.ingest.completed`, `logos.proposal.applied`, etc.) is out of scope.
 
 ## What to do when an event arrives
 
@@ -120,6 +121,37 @@ Use `jq -n --arg` to JSON-escape user input — never concatenate raw user text 
 
 **No retries.** A single attempt is the whole story for this surface. If the user wants to try again they can re-send the reply.
 
+## Digest ready event (`logos.digest.ready`)
+
+Logos publishes a daily proposals digest at 15:00 UTC (09:00 CST) on the same `logos.events` topic exchange. The digest body is precomputed by Logos — pending proposals listed as short-id (first 8 hex), kind, and page slug, or the literal `No pending Logos proposals.` when the queue is empty.
+
+Routing key: `logos.digest.ready` · Exchange: `logos.events` (topic, durable) · Frequency: daily at 15:00 UTC (09:00 CST).
+
+### Event payload
+
+```json
+{
+  "message": "<digest text>"
+}
+```
+
+Field is snake_case to match the wire format. No other fields are emitted; do not assume future enrichment.
+
+### What to do when an event arrives
+
+Forward `message` to Telegram **verbatim** via your `send_message` destination — no reformatting, no enrichment, no truncation, no reply prompt appended. Logos owns the wording. One message per event; no retries; no reply path back to Logos for this event (the digest is notify-only — replies, if any, fall through to the normal conversational path).
+
+### Smoke
+
+Same `rabbitmqadmin` pattern as `logos.proposal.created` (see "Subscribing to the exchange" below) — just swap the routing key + payload:
+
+```bash
+rabbitmqadmin publish \
+  exchange=logos.events \
+  routing_key=logos.digest.ready \
+  payload='{"message":"No pending Logos proposals."}'
+```
+
 ## Subscribing to the exchange (debugging + smoke)
 
 Day-to-day, host-side wiring delivers the event payload to the agent (NanoClaw routes the parsed event into the agent group like any other prompt — see `~/nanoclaw/src/router.ts`). For manual smoke or debugging from inside the container, you can publish or consume directly with `rabbitmqadmin`:
@@ -146,4 +178,4 @@ The shared consumer queue `logos.events.consumer` belongs to Logos itself — do
 - Threading state across multiple proposals (no "active proposal" — every reply must include the short-id).
 - Durable consumer queue owned by NanoClaw. The host-side router or a temp queue is enough for v1.
 - Backfill of historical proposals.
-- Other routing keys on `logos.events` (`ingest.completed`, `proposal.applied`, etc.).
+- Other routing keys on `logos.events` (`ingest.completed`, `proposal.applied`, etc.) — only `logos.proposal.created` and `logos.digest.ready` are handled here.
