@@ -109,9 +109,14 @@ function fetchVaultSecret(key: string): Promise<string | undefined> {
           }
           try {
             const data = JSON.parse(body);
-            // Support { value: "..." } or { secret: { value: "..." } }
+            // Support legacy/raw shapes plus the current Solo Vault
+            // envelope: { data: { value: "..." } }.
             const value =
-              typeof data.value === 'string' ? data.value : data.secret?.value;
+              typeof data.data?.value === 'string'
+                ? data.data.value
+                : typeof data.value === 'string'
+                  ? data.value
+                  : data.secret?.value;
             if (typeof value !== 'string') {
               reject(
                 new Error(

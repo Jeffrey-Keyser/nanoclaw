@@ -101,6 +101,32 @@ describe('env', () => {
     }
   });
 
+  it('refreshSecrets accepts Solo Vault data.value responses', async () => {
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { value: 'nested-vault-value' } }));
+    });
+    await new Promise<void>((resolve) =>
+      server.listen(0, '127.0.0.1', resolve),
+    );
+    const port = (server.address() as AddressInfo).port;
+
+    try {
+      process.env.SOLO_VAULT_TOKEN = 'test-token';
+      process.env.SOLO_VAULT_URL = `http://127.0.0.1:${port}`;
+
+      const { initSecrets, refreshSecrets, readEnvFile } =
+        await import('./env.js');
+      await initSecrets();
+      await refreshSecrets(['ANTHROPIC_API_KEY']);
+
+      const result = readEnvFile(['ANTHROPIC_API_KEY']);
+      expect(result.ANTHROPIC_API_KEY).toBe('nested-vault-value');
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
   it('refreshSecrets skips keys that are still cached (TTL not expired)', async () => {
     let requestCount = 0;
     const server = http.createServer((_req, res) => {
