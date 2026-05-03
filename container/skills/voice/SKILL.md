@@ -37,7 +37,7 @@ Request body:
 {
   "text": "<the words to speak>",
   "voiceId": "LzNi2JfTCf9ggr4ibvHF",
-  "modelId": "eleven_turbo_v2_5",
+  "modelId": "eleven_multilingual_v2",
   "outputFormat": "mp3_44100_128"
 }
 ```
