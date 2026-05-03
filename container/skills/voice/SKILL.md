@@ -36,13 +36,13 @@ Request body:
 ```json
 {
   "text": "<the words to speak>",
-  "voiceId": "pNInz6obpgDQGcFmaJgB",
+  "voiceId": "LzNi2JfTCf9ggr4ibvHF",
   "modelId": "eleven_turbo_v2_5",
   "outputFormat": "mp3_44100_128"
 }
 ```
 
-- `voiceId` defaults to `pNInz6obpgDQGcFmaJgB` (Adam, premade free-tier voice). Only override if the user has named a different voice.
+- `voiceId` defaults to `LzNi2JfTCf9ggr4ibvHF` (Absurdly deep voiced man, generated free-tier voice). Only override if the user has named a different voice.
 - `outputFormat` for local playback: `mp3_44100_128` (default).
 - `outputFormat` for Telegram voice: `opus_48000_64`.
 
@@ -79,7 +79,7 @@ Audio goes through PulseAudio with `module-bluetooth-discover` loaded, into the 
    curl -sS -N \
      -H "Authorization: Bearer $AI_PROXY_API_KEY" \
      -H "Content-Type: application/json" \
-     -d '{"text":"<your text here>","voiceId":"pNInz6obpgDQGcFmaJgB","outputFormat":"mp3_44100_128"}' \
+     -d '{"text":"<your text here>","voiceId":"LzNi2JfTCf9ggr4ibvHF","outputFormat":"mp3_44100_128"}' \
      http://localhost:3005/v1/tts/stream \
    | ffmpeg -hide_banner -loglevel error -i pipe:0 -f wav - \
    | paplay --device="$SINK"
@@ -94,7 +94,7 @@ Always JSON-escape the text. Use `jq` to construct the body so quotes/newlines/b
 ```bash
 BODY=$(jq -nc \
   --arg text "$REPLY_TEXT" \
-  --arg voice "pNInz6obpgDQGcFmaJgB" \
+  --arg voice "LzNi2JfTCf9ggr4ibvHF" \
   --arg fmt "mp3_44100_128" \
   '{text:$text, voiceId:$voice, outputFormat:$fmt}')
 
@@ -118,7 +118,7 @@ Telegram voice notes must be Opus in an OGG container. Request `opus_48000_64`, 
    ```bash
    BODY=$(jq -nc \
      --arg text "$REPLY_TEXT" \
-     --arg voice "pNInz6obpgDQGcFmaJgB" \
+     --arg voice "LzNi2JfTCf9ggr4ibvHF" \
      --arg fmt "opus_48000_64" \
      '{text:$text, voiceId:$voice, outputFormat:$fmt}')
 
@@ -151,7 +151,7 @@ If you have a higher-level `send_voice` destination tool exposed by the runtime,
 
 | Setting | Default | Notes |
 |---------|---------|-------|
-| Voice ID | `pNInz6obpgDQGcFmaJgB` | Adam (premade, works on free tier). |
+| Voice ID | `LzNi2JfTCf9ggr4ibvHF` | Absurdly deep voiced man (generated, free tier). |
 | Output (speaker) | `mp3_44100_128` | Decoded by `ffmpeg`, played by `paplay`. |
 | Output (Telegram) | `opus_48000_64` | Required format for Telegram voice notes. |
 | Temp file | `/tmp/tts_voice.ogg` | Removed after send. |
