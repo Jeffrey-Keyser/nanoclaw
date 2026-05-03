@@ -27,7 +27,8 @@ Single Node.js process with a skill-based channel system.
 | `src/dispatch-pool.ts`     | Dispatch slot lifecycle, recovery, and drain behavior |
 | `src/service-health.ts`    | Builds the `/health` payload                          |
 | `src/db.ts`                | SQLite operations                                     |
-| `groups/{name}/CLAUDE.md`  | Per-group memory (isolated)                           |
+| `groups/{name}/CLAUDE.local.md` | Editable per-group memory and persona source          |
+| `groups/{name}/CLAUDE.md`  | Generated runtime wrapper composed at container spawn |
 
 ## Skills
 
@@ -62,7 +63,14 @@ npm run build:core   # Compile the main service
 npm run build:agent-runner
 npm run smoke:runtime
 npm run smoke:health
+npm run smoke:db-container
 ```
+
+Per-group instruction files:
+
+- Edit `groups/{name}/CLAUDE.local.md` for durable group-specific memory and persona.
+- Treat `groups/{name}/CLAUDE.md` as generated runtime state. Some groups now rewrite it at container spawn into a composed wrapper that references `CLAUDE.local.md` plus module fragments.
+- If `groups/{name}/CLAUDE.md` appears dirty after a wake, verify whether the generated wrapper is the new canonical format before restoring it.
 
 ### Testing
 

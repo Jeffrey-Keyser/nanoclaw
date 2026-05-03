@@ -150,7 +150,16 @@ These handle worktree conflicts, missing commits, API retries, CI wait logic, an
 ```bash
 npm run smoke:runtime
 npm run smoke:health
+npm run smoke:db-container
 ```
+
+`smoke:db-container` is the operational smoke test for the v2 DB-backed agent path. It:
+
+- injects a CLI-routed message into a live agent session without sending Telegram output
+- waits for a fresh Docker container spawn
+- verifies the reply through the session `outbound.db` instead of the interactive CLI socket
+
+For groups that use generated wrappers, `groups/{name}/CLAUDE.local.md` is the editable source of truth and `groups/{name}/CLAUDE.md` may be rewritten at spawn.
 
 Build paths:
 
