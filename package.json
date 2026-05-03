@@ -28,6 +28,7 @@
     "test:watch": "vitest",
     "smoke:runtime": "node scripts/smoke-runtime.mjs",
     "smoke:health": "node scripts/health-check.mjs",
+    "smoke:db-container": "node scripts/smoke-db-container.mjs",
     "status": "tsx scripts/nanoclaw-status.ts",
     "health-check": "tsx scripts/ecosystem-health-check.ts",
     "verify": "tsx src/cli/verify.ts"
