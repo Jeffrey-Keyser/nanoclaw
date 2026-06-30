@@ -15,6 +15,7 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import {
   countRecentMessages,
   getBatchedMessages,
+  listToolEventsForAgencyHq,
   getOutboundMessage,
   insertOutboundMessage,
   updateMessageStatus,
@@ -23,6 +24,7 @@ import type {
   MessagePriority,
   MessageTemplate,
   OutboundMessage,
+  ToolEventsQuery,
 } from './db/index.js';
 import { logger } from './logger.js';
 import { Channel } from './types.js';
@@ -70,6 +72,7 @@ const VALID_TEMPLATES: MessageTemplate[] = [
   'notification',
   'custom',
 ];
+const TOOL_EVENTS_ROUTE = '/api/v1/tool-events';
 
 interface MessageRequest {
   recipient: string;
@@ -152,6 +155,51 @@ function validateRequest(
       batch_window: obj.batch_window as number | undefined,
     },
   };
+}
+
+function validateToolEventsQuery(
+  params: URLSearchParams,
+): { ok: true; data: ToolEventsQuery } | { ok: false; error: string } {
+  const query: ToolEventsQuery = {};
+  const since = params.get('since');
+  if (since !== null) {
+    if (!since || isNaN(Date.parse(since))) {
+      return {
+        ok: false,
+        error: 'since must be a valid ISO 8601 date string',
+      };
+    }
+    query.since = since;
+  }
+
+  const limit = params.get('limit');
+  if (limit !== null) {
+    if (!/^\d+$/.test(limit)) {
+      return { ok: false, error: 'limit must be a positive integer' };
+    }
+    const parsed = Number(limit);
+    if (!Number.isSafeInteger(parsed) || parsed < 1) {
+      return { ok: false, error: 'limit must be a positive integer' };
+    }
+    query.limit = parsed;
+  }
+
+  const sessionId = params.get('session_id');
+  if (sessionId) query.sessionId = sessionId;
+
+  const groupFolder = params.get('group_folder');
+  if (groupFolder) query.groupFolder = groupFolder;
+
+  const taskId = params.get('task_id');
+  if (taskId) query.taskId = taskId;
+
+  const runId = params.get('run_id');
+  if (runId) query.runId = runId;
+
+  const eventType = params.get('event_type');
+  if (eventType) query.eventType = eventType;
+
+  return { ok: true, data: query };
 }
 
 // --- Batching ---
@@ -395,6 +443,17 @@ async function handlePostMessage(
   jsonResponse(res, 201, { id, status: 'pending' });
 }
 
+function handleGetToolEvents(req: IncomingMessage, res: ServerResponse): void {
+  const requestUrl = new URL(req.url ?? TOOL_EVENTS_ROUTE, 'http://127.0.0.1');
+  const validation = validateToolEventsQuery(requestUrl.searchParams);
+  if (!validation.ok) {
+    jsonResponse(res, 400, { error: validation.error });
+    return;
+  }
+
+  jsonResponse(res, 200, listToolEventsForAgencyHq(validation.data));
+}
+
 // --- Server ---
 
 let httpServer: Server | null = null;
@@ -408,6 +467,23 @@ export function startMessageApi(
 
   return new Promise((resolve, reject) => {
     httpServer = createServer(async (req, res) => {
+      // GET /api/v1/tool-events — stable read-only contract consumed by Agency HQ
+      if (req.method === 'GET') {
+        const requestUrl = new URL(
+          req.url ?? TOOL_EVENTS_ROUTE,
+          'http://127.0.0.1',
+        );
+        if (requestUrl.pathname === TOOL_EVENTS_ROUTE) {
+          try {
+            handleGetToolEvents(req, res);
+          } catch (err) {
+            logger.error({ err }, 'Unhandled error in tool events API');
+            jsonResponse(res, 500, { error: 'Internal server error' });
+          }
+          return;
+        }
+      }
+
       // POST /api/v1/messages
       if (req.method === 'POST' && req.url === '/api/v1/messages') {
         try {
@@ -477,7 +553,9 @@ export function stopMessageApi(): Promise<void> {
 /** @internal — exported for testing */
 export {
   validateRequest as _validateRequest,
+  validateToolEventsQuery as _validateToolEventsQuery,
   handlePostMessage as _handlePostMessage,
+  handleGetToolEvents as _handleGetToolEvents,
   deliverWithRetry as _deliverWithRetry,
   flushBatch as _flushBatch,
   RATE_LIMIT_MAX as _RATE_LIMIT_MAX,

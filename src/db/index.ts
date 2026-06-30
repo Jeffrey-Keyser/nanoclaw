@@ -118,8 +118,12 @@ export {
 
 export {
   InsertToolCallEvent,
+  ToolEventsQuery,
+  ToolEventsResponse,
   ToolCallEvent,
   getRecentToolEvents,
   insertToolCallEvent,
+  listToolEventsForAgencyHq,
+  normalizeToolEventsLimit,
   pruneToolEvents,
 } from './tool-events.js';

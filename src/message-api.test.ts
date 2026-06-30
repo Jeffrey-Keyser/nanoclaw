@@ -6,12 +6,14 @@ import {
   getOutboundMessage,
   insertOutboundMessage,
   countRecentMessages,
+  insertToolCallEvent,
 } from './db/index.js';
 import {
   renderTemplate,
   startMessageApi,
   stopMessageApi,
   _validateRequest,
+  _validateToolEventsQuery,
 } from './message-api.js';
 
 import path from 'path';
@@ -173,6 +175,47 @@ describe('message-api', () => {
     });
   });
 
+  describe('validateToolEventsQuery', () => {
+    it('accepts supported Agency HQ filter parameters', () => {
+      const result = _validateToolEventsQuery(
+        new URLSearchParams({
+          since: '2026-06-30T00:00:00.000Z',
+          limit: '25',
+          session_id: 'sess-1',
+          group_folder: 'dev',
+          task_id: 'task-1',
+          run_id: 'run-1',
+          event_type: 'PostToolUse',
+        }),
+      );
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.data).toEqual({
+          since: '2026-06-30T00:00:00.000Z',
+          limit: 25,
+          sessionId: 'sess-1',
+          groupFolder: 'dev',
+          taskId: 'task-1',
+          runId: 'run-1',
+          eventType: 'PostToolUse',
+        });
+      }
+    });
+
+    it('rejects invalid since and limit parameters', () => {
+      expect(
+        _validateToolEventsQuery(new URLSearchParams({ since: 'nope' })).ok,
+      ).toBe(false);
+      expect(
+        _validateToolEventsQuery(new URLSearchParams({ limit: '0' })).ok,
+      ).toBe(false);
+      expect(
+        _validateToolEventsQuery(new URLSearchParams({ limit: '1.5' })).ok,
+      ).toBe(false);
+    });
+  });
+
   describe('HTTP server', () => {
     let testPort: number;
 
@@ -328,6 +371,136 @@ describe('message-api', () => {
       );
 
       expect(res.statusCode).toBe(404);
+    });
+
+    it('GET /api/v1/tool-events returns normalized recent tool events', async () => {
+      insertToolCallEvent({
+        session_id: 'sess-tool-1',
+        event_type: 'PostToolUse',
+        tool_name: 'Bash',
+        payload: {
+          group_folder: 'dev',
+          task_id: 'task-123',
+          run_id: 'run-123',
+          tool_use_id: 'toolu_123',
+          tool_input: '{"command":"git status"}',
+          tool_response: 'On branch main',
+        },
+      });
+
+      const res = await makeRequest(testPort, 'GET', '/api/v1/tool-events');
+
+      expect(res.statusCode).toBe(200);
+      const body = res.body as {
+        events: Array<{
+          id: string;
+          occurredAt: string;
+          sessionId: string;
+          groupFolder: string;
+          taskId: string;
+          runId: string;
+          eventType: string;
+          toolName: string;
+          toolUseId: string;
+          input: string;
+          response: string;
+        }>;
+        limit: number;
+      };
+      expect(body.limit).toBe(100);
+      expect(body.events).toHaveLength(1);
+      expect(body.events[0]).toMatchObject({
+        sessionId: 'sess-tool-1',
+        groupFolder: 'dev',
+        taskId: 'task-123',
+        runId: 'run-123',
+        eventType: 'PostToolUse',
+        toolName: 'Bash',
+        toolUseId: 'toolu_123',
+        input: '{"command":"git status"}',
+        response: 'On branch main',
+      });
+      expect(body.events[0].occurredAt).toMatch(/T.*Z$/);
+    });
+
+    it('GET /api/v1/tool-events applies limit and identifier filters', async () => {
+      insertToolCallEvent({
+        session_id: 'sess-filter-1',
+        event_type: 'PostToolUse',
+        tool_name: 'Bash',
+        payload: {
+          group_folder: 'dev',
+          task_id: 'task-filter',
+          run_id: 'run-filter',
+        },
+      });
+      insertToolCallEvent({
+        session_id: 'sess-filter-2',
+        event_type: 'PostToolUseFailure',
+        tool_name: 'Read',
+        payload: { group_folder: 'ops', task_id: 'other-task' },
+      });
+      insertToolCallEvent({
+        session_id: 'sess-filter-1',
+        event_type: 'PostToolUse',
+        tool_name: 'Edit',
+        payload: {
+          group_folder: 'dev',
+          task_id: 'task-filter',
+          run_id: 'run-filter',
+        },
+      });
+
+      const res = await makeRequest(
+        testPort,
+        'GET',
+        '/api/v1/tool-events?session_id=sess-filter-1&group_folder=dev&task_id=task-filter&run_id=run-filter&event_type=PostToolUse&limit=1',
+      );
+
+      expect(res.statusCode).toBe(200);
+      const body = res.body as {
+        events: Array<{ sessionId: string; groupFolder: string }>;
+        limit: number;
+      };
+      expect(body.limit).toBe(1);
+      expect(body.events).toHaveLength(1);
+      expect(body.events[0].sessionId).toBe('sess-filter-1');
+      expect(body.events[0].groupFolder).toBe('dev');
+    });
+
+    it('GET /api/v1/tool-events applies since filtering', async () => {
+      insertToolCallEvent({
+        session_id: 'sess-since-1',
+        event_type: 'PostToolUse',
+        tool_name: 'Bash',
+      });
+
+      const future = new Date(Date.now() + 60_000).toISOString();
+      const res = await makeRequest(
+        testPort,
+        'GET',
+        `/api/v1/tool-events?since=${encodeURIComponent(future)}`,
+      );
+
+      expect(res.statusCode).toBe(200);
+      const body = res.body as { events: unknown[] };
+      expect(body.events).toHaveLength(0);
+    });
+
+    it('GET /api/v1/tool-events returns 400 for invalid query input', async () => {
+      const invalidSince = await makeRequest(
+        testPort,
+        'GET',
+        '/api/v1/tool-events?since=not-a-date',
+      );
+      expect(invalidSince.statusCode).toBe(400);
+
+      const invalidLimit = await makeRequest(
+        testPort,
+        'GET',
+        '/api/v1/tool-events?limit=-1',
+      );
+      expect(invalidLimit.statusCode).toBe(400);
     });
 
     it('returns 404 for unknown routes', async () => {
