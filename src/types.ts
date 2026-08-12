@@ -37,8 +37,10 @@ export interface ContainerConfig {
   mcpCredentialMounts?: McpCredentialMount[]; // MCP server credential directories (bypasses additionalMounts security blocklist)
   timeout?: number; // Default: 300000 (5 minutes)
   provider?: 'opencode' | 'codex';
+  cliBin?: string;
   model?: string;
   fallbackProvider?: 'opencode' | 'codex' | null;
+  fallbackCliBin?: string;
   fallbackModel?: string;
   assistantName?: string;
 }

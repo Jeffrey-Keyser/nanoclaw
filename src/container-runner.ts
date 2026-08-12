@@ -265,8 +265,14 @@ export async function runContainerAgent(
   // Build environment for the session
   const sessionEnv = buildSessionEnv(mounts);
   if (group.containerConfig?.provider) {
+    const providerChanged =
+      group.containerConfig.provider !== sessionEnv.AGENT_RUNNER_BACKEND;
     sessionEnv.AGENT_RUNNER_BACKEND = group.containerConfig.provider;
-    sessionEnv.AGENT_CLI_BIN = group.containerConfig.provider;
+    sessionEnv.AGENT_CLI_BIN =
+      group.containerConfig.cliBin ||
+      (providerChanged
+        ? group.containerConfig.provider
+        : sessionEnv.AGENT_CLI_BIN);
   }
   if (group.containerConfig?.model) {
     sessionEnv.AGENT_MODEL = group.containerConfig.model;
@@ -276,8 +282,15 @@ export async function runContainerAgent(
     delete sessionEnv.AGENT_FALLBACK_CLI_BIN;
     delete sessionEnv.AGENT_FALLBACK_MODEL;
   } else if (group.containerConfig?.fallbackProvider) {
+    const providerChanged =
+      group.containerConfig.fallbackProvider !==
+      sessionEnv.AGENT_FALLBACK_BACKEND;
     sessionEnv.AGENT_FALLBACK_BACKEND = group.containerConfig.fallbackProvider;
-    sessionEnv.AGENT_FALLBACK_CLI_BIN = group.containerConfig.fallbackProvider;
+    sessionEnv.AGENT_FALLBACK_CLI_BIN =
+      group.containerConfig.fallbackCliBin ||
+      (providerChanged
+        ? group.containerConfig.fallbackProvider
+        : sessionEnv.AGENT_FALLBACK_CLI_BIN);
   }
   if (group.containerConfig?.fallbackModel) {
     sessionEnv.AGENT_FALLBACK_MODEL = group.containerConfig.fallbackModel;
