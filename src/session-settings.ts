@@ -1,6 +1,6 @@
 /**
  * Session Settings for NanoClaw
- * Bootstraps Claude session configuration and compiles the agent-runner.
+ * Bootstraps per-group session configuration and compiles the agent-runner.
  */
 import { execSync } from 'child_process';
 import fs from 'fs';
@@ -8,6 +8,10 @@ import path from 'path';
 
 import {
   AGENT_CLI_BIN,
+  AGENT_MODEL,
+  AGENT_FALLBACK_BACKEND,
+  AGENT_FALLBACK_CLI_BIN,
+  AGENT_FALLBACK_MODEL,
   AGENT_RUNNER_BACKEND,
   AUTO_COMPACT_ENABLED,
   AUTO_COMPACT_THRESHOLD,
@@ -20,7 +24,7 @@ import { logger } from './logger.js';
 import type { VolumeMount } from './container-runner.js';
 
 /**
- * Bootstrap the Claude session settings directory for a group.
+ * Bootstrap the legacy-compatible session settings directory for a group.
  * Creates the settings.json file and syncs skills.
  * Returns the host path to the session directory.
  */
@@ -146,11 +150,16 @@ export function buildSessionEnv(mounts: VolumeMount[]): Record<string, string> {
     } else if (mount.containerPath === '/workspace/global') {
       env.NANOCLAW_GLOBAL_DIR = mount.hostPath;
     } else if (mount.containerPath === '/workspace/ipc') {
+      env.NANOCLAW_IPC_DIR = mount.hostPath;
       env.NANOCLAW_IPC_INPUT_DIR = path.join(mount.hostPath, 'input');
     } else if (mount.containerPath === '/home/node/.claude') {
       env.CLAUDE_CONFIG_DIR = mount.hostPath;
-    } else if (mount.containerPath === '/workspace/extra') {
-      env.NANOCLAW_EXTRA_DIR = mount.hostPath;
+    } else if (mount.containerPath.startsWith('/workspace/extra/')) {
+      const key = mount.containerPath
+        .slice('/workspace/extra/'.length)
+        .replace(/[^a-zA-Z0-9]/g, '_')
+        .toUpperCase();
+      env[`NANOCLAW_EXTRA_DIR_${key}`] = mount.hostPath;
     }
   }
 
@@ -163,6 +172,10 @@ export function buildSessionEnv(mounts: VolumeMount[]): Record<string, string> {
   // Provider-agnostic backend configuration
   env.AGENT_RUNNER_BACKEND = AGENT_RUNNER_BACKEND;
   env.AGENT_CLI_BIN = AGENT_CLI_BIN;
+  env.AGENT_MODEL = AGENT_MODEL;
+  env.AGENT_FALLBACK_BACKEND = AGENT_FALLBACK_BACKEND;
+  env.AGENT_FALLBACK_CLI_BIN = AGENT_FALLBACK_CLI_BIN;
+  env.AGENT_FALLBACK_MODEL = AGENT_FALLBACK_MODEL;
 
   return env;
 }
@@ -176,7 +189,20 @@ export function ensureAgentRunnerCompiled(): string {
   const agentRunnerDir = path.join(projectRoot, 'container', 'agent-runner');
   const distIndex = path.join(agentRunnerDir, 'dist', 'index.js');
 
-  if (!fs.existsSync(distIndex)) {
+  const sourceDir = path.join(agentRunnerDir, 'src');
+  const newestSourceMtime = fs
+    .readdirSync(sourceDir)
+    .filter((name) => name.endsWith('.ts'))
+    .reduce(
+      (latest, name) =>
+        Math.max(latest, fs.statSync(path.join(sourceDir, name)).mtimeMs),
+      0,
+    );
+  const needsBuild =
+    !fs.existsSync(distIndex) ||
+    newestSourceMtime > fs.statSync(distIndex).mtimeMs;
+
+  if (needsBuild) {
     logger.info('Compiling agent-runner for host execution...');
     try {
       execSync('npm run build', {

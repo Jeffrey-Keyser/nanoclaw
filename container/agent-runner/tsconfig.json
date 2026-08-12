@@ -10,6 +10,6 @@
     "skipLibCheck": true,
     "declaration": true
   },
-  "include": ["src/**/*"],
+  "include": ["src/index.ts", "src/ipc-mcp-stdio.ts"],
   "exclude": ["node_modules", "dist"]
 }

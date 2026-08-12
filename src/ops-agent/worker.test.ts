@@ -14,6 +14,7 @@ import {
   buildOpsPrompt,
   buildCliArgs,
   executeTask,
+  normalizeCliOutput,
   reportResult,
   pollTick,
   startPolling,
@@ -157,10 +158,18 @@ describe('ops-agent/worker', () => {
 
       const promise = executeTask('test prompt', 5000);
 
-      // Without dispatch-config, should use env default 'claude' and no --model flag
+      // Without dispatch-config, use the provider-neutral OpenCode default.
       expect(spawn).toHaveBeenCalledWith(
-        'claude',
-        ['--print', '--dangerously-skip-permissions', 'test prompt'],
+        'opencode',
+        [
+          'run',
+          '--auto',
+          '--format',
+          'json',
+          '--model',
+          'opencode-go/deepseek-v4-flash',
+          'test prompt',
+        ],
         expect.objectContaining({
           stdio: ['pipe', 'pipe', 'pipe'],
         }),
@@ -189,7 +198,11 @@ describe('ops-agent/worker', () => {
       fetchMock.mockResolvedValueOnce(
         mockFetchResponse({
           success: true,
-          data: { model: 'claude-sonnet-4-5-20250929', cli_bin: 'claude' },
+          data: {
+            provider: 'claude',
+            model: 'claude-sonnet-4-5-20250929',
+            cli_bin: 'claude',
+          },
         }),
       );
       await refreshConfig();
@@ -208,6 +221,8 @@ describe('ops-agent/worker', () => {
         'claude',
         [
           '--print',
+          '--output-format',
+          'stream-json',
           '--dangerously-skip-permissions',
           '--model',
           'claude-sonnet-4-5-20250929',
@@ -293,8 +308,7 @@ describe('ops-agent/worker', () => {
     it('falls back to AGENT_CLI_BIN for unknown provider', () => {
       const config = resolveConfig({ provider: 'unknown-provider' });
       expect(config.provider).toBe('unknown-provider');
-      // Falls back to AGENT_CLI_BIN (default: 'claude')
-      expect(config.cliBin).toBe('claude');
+      expect(config.cliBin).toBe('opencode');
     });
   });
 
@@ -306,6 +320,8 @@ describe('ops-agent/worker', () => {
       );
       expect(args).toEqual([
         '--print',
+        '--output-format',
+        'stream-json',
         '--dangerously-skip-permissions',
         'do stuff',
       ]);
@@ -376,6 +392,26 @@ describe('ops-agent/worker', () => {
       ]);
     });
 
+    it('opencode: runs non-interactively with JSON events', () => {
+      const args = buildCliArgs(
+        {
+          provider: 'opencode',
+          cliBin: 'opencode',
+          model: 'opencode-go/deepseek-v4-flash',
+        },
+        'do stuff',
+      );
+      expect(args).toEqual([
+        'run',
+        '--auto',
+        '--format',
+        'json',
+        '--model',
+        'opencode-go/deepseek-v4-flash',
+        'do stuff',
+      ]);
+    });
+
     it('unknown provider falls through to claude defaults', () => {
       const args = buildCliArgs(
         { provider: 'future-ai', cliBin: 'future-ai', model: undefined },
@@ -383,6 +419,24 @@ describe('ops-agent/worker', () => {
       );
       expect(args).toContain('--print');
       expect(args).toContain('--dangerously-skip-permissions');
+    });
+  });
+
+  describe('normalizeCliOutput', () => {
+    it('extracts OpenCode text events', () => {
+      const raw = [
+        JSON.stringify({ type: 'step_start' }),
+        JSON.stringify({ type: 'text', part: { text: 'diagnostic result' } }),
+      ].join('\n');
+      expect(normalizeCliOutput('opencode', raw)).toBe('diagnostic result');
+    });
+
+    it('extracts the final Codex agent message', () => {
+      const raw = JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'codex result' },
+      });
+      expect(normalizeCliOutput('codex', raw)).toBe('codex result');
     });
   });
 

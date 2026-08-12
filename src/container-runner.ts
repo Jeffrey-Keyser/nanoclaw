@@ -195,6 +195,25 @@ export async function runContainerAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
   correlationId?: string,
 ): Promise<ContainerOutput> {
+  // Runtime/provider configuration is durable in the group folder so it can
+  // be changed without rewriting registration rows. Registration-level
+  // settings (notably mounts) remain the base and folder config overrides it.
+  try {
+    const folderConfigPath = path.join(
+      resolveGroupFolderPath(group.folder),
+      'container.json',
+    );
+    const folderConfig = JSON.parse(
+      fs.readFileSync(folderConfigPath, 'utf8'),
+    ) as RegisteredGroup['containerConfig'];
+    group = {
+      ...group,
+      containerConfig: { ...group.containerConfig, ...folderConfig },
+    };
+  } catch {
+    // Missing/invalid folder config falls back to registered + global config.
+  }
+
   const startTime = Date.now();
   const cid = correlationId ?? generateCorrelationId();
   const log = createCorrelationLogger(cid, { group: group.name });
@@ -245,6 +264,24 @@ export async function runContainerAgent(
 
   // Build environment for the session
   const sessionEnv = buildSessionEnv(mounts);
+  if (group.containerConfig?.provider) {
+    sessionEnv.AGENT_RUNNER_BACKEND = group.containerConfig.provider;
+    sessionEnv.AGENT_CLI_BIN = group.containerConfig.provider;
+  }
+  if (group.containerConfig?.model) {
+    sessionEnv.AGENT_MODEL = group.containerConfig.model;
+  }
+  if (group.containerConfig?.fallbackProvider === null) {
+    delete sessionEnv.AGENT_FALLBACK_BACKEND;
+    delete sessionEnv.AGENT_FALLBACK_CLI_BIN;
+    delete sessionEnv.AGENT_FALLBACK_MODEL;
+  } else if (group.containerConfig?.fallbackProvider) {
+    sessionEnv.AGENT_FALLBACK_BACKEND = group.containerConfig.fallbackProvider;
+    sessionEnv.AGENT_FALLBACK_CLI_BIN = group.containerConfig.fallbackProvider;
+  }
+  if (group.containerConfig?.fallbackModel) {
+    sessionEnv.AGENT_FALLBACK_MODEL = group.containerConfig.fallbackModel;
+  }
 
   // Build the tmux command
   const envString = Object.entries(sessionEnv)

@@ -1,6 +1,7 @@
 import { getRegisteredChannelNames } from './channels/registry.js';
 import { loadCredentialStateSync } from './credentials.js';
 import { getRuntimeStatus } from './runtime-adapter.js';
+import { getProviderDiagnostics } from './provider-health.js';
 import { getSubsystemStatuses } from './subsystem-status.js';
 import type { Channel, RegisteredGroup } from './types.js';
 
@@ -22,6 +23,7 @@ export interface ServiceHealthSnapshot {
     authMode: string;
     source: string;
   };
+  providers: ReturnType<typeof getProviderDiagnostics>;
   channels: {
     registered: string[];
     active: Array<{
@@ -41,6 +43,7 @@ export function buildServiceHealthSnapshot(
 ): ServiceHealthSnapshot {
   const runtimeStatus = getRuntimeStatus();
   const credentialState = loadCredentialStateSync();
+  const providers = getProviderDiagnostics();
   const registeredChannelNames = getRegisteredChannelNames();
   const activeChannels = channels.map((channel) => {
     const health = getChannelHealth(channel.name);
@@ -56,6 +59,9 @@ export function buildServiceHealthSnapshot(
   const degradedReasons: string[] = [];
   if (!runtimeStatus.ready) {
     degradedReasons.push('runtime dependency unavailable');
+  }
+  if (!providers.primary.available && !providers.fallback?.available) {
+    degradedReasons.push('no configured agent provider available');
   }
   if (registeredChannelNames.length === 0) {
     degradedReasons.push('no channel handlers registered');
@@ -92,6 +98,7 @@ export function buildServiceHealthSnapshot(
       authMode: credentialState.authMode,
       source: credentialState.credentialSource,
     },
+    providers,
     channels: {
       registered: registeredChannelNames,
       active: activeChannels,

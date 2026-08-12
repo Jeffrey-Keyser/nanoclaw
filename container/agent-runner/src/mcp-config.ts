@@ -26,6 +26,7 @@ export function writeMcpConfig(options: McpConfigOptions): string {
           NANOCLAW_CHAT_JID: options.chatJid,
           NANOCLAW_GROUP_FOLDER: options.groupFolder,
           NANOCLAW_IS_MAIN: options.isMain ? '1' : '0',
+          NANOCLAW_IPC_DIR: process.env.NANOCLAW_IPC_DIR || '/workspace/ipc',
         },
       },
     },

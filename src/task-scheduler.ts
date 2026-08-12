@@ -222,7 +222,7 @@ export async function runScheduledTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
-        assistantName: ASSISTANT_NAME,
+        assistantName: group.containerConfig?.assistantName || group.name,
       },
       (proc, containerName) =>
         deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),

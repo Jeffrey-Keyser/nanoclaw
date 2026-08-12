@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 
 import { CREDENTIAL_PROXY_PORT, GROUPS_DIR } from './config.js';
 import { startCredentialProxy } from './credential-proxy.js';
@@ -28,6 +29,7 @@ import {
   setRouterState,
   storeChatMetadata,
   storeMessage,
+  storeMessageDirect,
 } from './db/index.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -536,10 +538,35 @@ export async function initApp(): Promise<void> {
 
   // Start message API (POST /api/v1/messages for proactive messaging)
   try {
-    await startMessageApi(() => channels);
+    await startMessageApi(
+      () => channels,
+      undefined,
+      undefined,
+      ({ recipient, instruction, source }) => {
+        const group = state.registeredGroups[recipient];
+        if (!group)
+          throw new Error(`Recipient is not registered: ${recipient}`);
+        const id = `agent-event-${crypto.randomUUID()}`;
+        const content =
+          !group.isMain && group.requiresTrigger !== false
+            ? `${group.trigger} ${instruction}`
+            : instruction;
+        storeMessageDirect({
+          id,
+          chat_jid: recipient,
+          sender: source || 'external-agent-event',
+          sender_name: source || 'External automation',
+          content,
+          timestamp: new Date().toISOString(),
+          is_from_me: false,
+          is_bot_message: false,
+        });
+        return id;
+      },
+    );
     setSubsystemState('message-api', {
       state: 'running',
-      details: 'POST /api/v1/messages endpoint active.',
+      details: 'Outbound message and inbound agent-event endpoints active.',
     });
   } catch (err) {
     setSubsystemState('message-api', {

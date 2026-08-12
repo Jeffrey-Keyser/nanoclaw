@@ -85,6 +85,45 @@ interface MessageRequest {
   batch_window?: number;
 }
 
+interface AgentEventRequest {
+  recipient: string;
+  instruction: string;
+  source?: string;
+}
+
+export type AgentEventSink = (
+  event: AgentEventRequest,
+) => Promise<string> | string;
+
+export function validateAgentEventRequest(
+  body: unknown,
+): { ok: true; data: AgentEventRequest } | { ok: false; error: string } {
+  if (!body || typeof body !== 'object') {
+    return { ok: false, error: 'Request body must be a JSON object' };
+  }
+  const obj = body as Record<string, unknown>;
+  if (typeof obj.recipient !== 'string' || !obj.recipient) {
+    return { ok: false, error: 'recipient is required and must be a string' };
+  }
+  if (typeof obj.instruction !== 'string' || !obj.instruction.trim()) {
+    return {
+      ok: false,
+      error: 'instruction is required and must be a non-empty string',
+    };
+  }
+  if (obj.source !== undefined && typeof obj.source !== 'string') {
+    return { ok: false, error: 'source must be a string' };
+  }
+  return {
+    ok: true,
+    data: {
+      recipient: obj.recipient,
+      instruction: obj.instruction,
+      source: (obj.source as string | undefined) || 'external-agent-event',
+    },
+  };
+}
+
 function validateRequest(
   body: unknown,
 ): { ok: true; data: MessageRequest } | { ok: false; error: string } {
@@ -443,6 +482,38 @@ async function handlePostMessage(
   jsonResponse(res, 201, { id, status: 'pending' });
 }
 
+async function handlePostAgentEvent(
+  req: IncomingMessage,
+  res: ServerResponse,
+  sink?: AgentEventSink,
+): Promise<void> {
+  if (!sink) {
+    jsonResponse(res, 503, { error: 'Agent event ingestion is unavailable' });
+    return;
+  }
+  let body: unknown;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch {
+    jsonResponse(res, 400, { error: 'Invalid JSON body' });
+    return;
+  }
+  const validation = validateAgentEventRequest(body);
+  if (!validation.ok) {
+    jsonResponse(res, 400, { error: validation.error });
+    return;
+  }
+  try {
+    const id = await sink(validation.data);
+    jsonResponse(res, 202, { id, status: 'queued-for-agent' });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    jsonResponse(res, /not registered/i.test(message) ? 404 : 500, {
+      error: message,
+    });
+  }
+}
+
 function handleGetToolEvents(req: IncomingMessage, res: ServerResponse): void {
   const requestUrl = new URL(req.url ?? TOOL_EVENTS_ROUTE, 'http://127.0.0.1');
   const validation = validateToolEventsQuery(requestUrl.searchParams);
@@ -462,6 +533,7 @@ export function startMessageApi(
   channelProvider: ChannelProvider,
   port: number = MESSAGE_API_PORT,
   host: string = '127.0.0.1',
+  agentEventSink?: AgentEventSink,
 ): Promise<Server> {
   const sendFn = createSendFn(channelProvider);
 
@@ -490,6 +562,19 @@ export function startMessageApi(
           await handlePostMessage(req, res, sendFn);
         } catch (err) {
           logger.error({ err }, 'Unhandled error in message API');
+          jsonResponse(res, 500, { error: 'Internal server error' });
+        }
+        return;
+      }
+
+      // POST /api/v1/agent-events — trusted local producers enqueue an
+      // instruction for an agent. Unlike /messages, this never delivers the
+      // supplied instruction directly to a human channel.
+      if (req.method === 'POST' && req.url === '/api/v1/agent-events') {
+        try {
+          await handlePostAgentEvent(req, res, agentEventSink);
+        } catch (err) {
+          logger.error({ err }, 'Unhandled error in agent event API');
           jsonResponse(res, 500, { error: 'Internal server error' });
         }
         return;

@@ -36,6 +36,11 @@ export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   mcpCredentialMounts?: McpCredentialMount[]; // MCP server credential directories (bypasses additionalMounts security blocklist)
   timeout?: number; // Default: 300000 (5 minutes)
+  provider?: 'opencode' | 'codex';
+  model?: string;
+  fallbackProvider?: 'opencode' | 'codex' | null;
+  fallbackModel?: string;
+  assistantName?: string;
 }
 
 export interface RegisteredGroup {

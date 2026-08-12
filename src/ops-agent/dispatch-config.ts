@@ -9,7 +9,7 @@
  * is unavailable or returns no config.
  */
 import { agencyFetch } from '../agency-hq-client.js';
-import { AGENT_CLI_BIN, AGENT_RUNNER_BACKEND } from '../config.js';
+import { AGENT_CLI_BIN, AGENT_MODEL, AGENT_RUNNER_BACKEND } from '../config.js';
 import { logger } from '../logger.js';
 
 // --- Provider → CLI binary mapping ---
@@ -20,6 +20,7 @@ const PROVIDER_CLI_MAP: Record<string, string> = {
   copilot: 'copilot',
   gemini: 'gemini',
   codex: 'codex',
+  opencode: 'opencode',
 };
 
 // --- Types ---
@@ -93,7 +94,7 @@ export function resolveConfig(
   return {
     provider,
     cliBin: apiConfig?.cli_bin || PROVIDER_CLI_MAP[provider] || AGENT_CLI_BIN,
-    model: apiConfig?.model || undefined,
+    model: apiConfig ? apiConfig.model || undefined : AGENT_MODEL || undefined,
   };
 }
 

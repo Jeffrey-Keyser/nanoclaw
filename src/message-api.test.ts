@@ -14,6 +14,7 @@ import {
   stopMessageApi,
   _validateRequest,
   _validateToolEventsQuery,
+  validateAgentEventRequest,
 } from './message-api.js';
 
 import path from 'path';
@@ -175,6 +176,32 @@ describe('message-api', () => {
     });
   });
 
+  describe('validateAgentEventRequest', () => {
+    it('accepts a provider-neutral instruction event', () => {
+      const result = validateAgentEventRequest({
+        recipient: 'tg:123',
+        instruction: 'Prepare the morning briefing',
+        source: 'openclaw-bridge',
+      });
+      expect(result).toEqual({
+        ok: true,
+        data: {
+          recipient: 'tg:123',
+          instruction: 'Prepare the morning briefing',
+          source: 'openclaw-bridge',
+        },
+      });
+    });
+
+    it('rejects an empty instruction', () => {
+      const result = validateAgentEventRequest({
+        recipient: 'tg:123',
+        instruction: '   ',
+      });
+      expect(result.ok).toBe(false);
+    });
+  });
+
   describe('validateToolEventsQuery', () => {
     it('accepts supported Agency HQ filter parameters', () => {
       const result = _validateToolEventsQuery(
@@ -218,6 +245,7 @@ describe('message-api', () => {
 
   describe('HTTP server', () => {
     let testPort: number;
+    const agentEventSink = vi.fn().mockResolvedValue('agent-event-1');
 
     const mockChannel = {
       name: 'test',
@@ -231,7 +259,13 @@ describe('message-api', () => {
     beforeEach(async () => {
       testPort = getPort();
       mockChannel.sendMessage.mockClear();
-      await startMessageApi(() => [mockChannel], testPort);
+      agentEventSink.mockClear();
+      await startMessageApi(
+        () => [mockChannel],
+        testPort,
+        '127.0.0.1',
+        agentEventSink,
+      );
     });
 
     afterEach(async () => {
@@ -248,6 +282,27 @@ describe('message-api', () => {
       const body = res.body as { id: string; status: string };
       expect(body.id).toBeDefined();
       expect(body.status).toBe('pending');
+    });
+
+    it('POST /api/v1/agent-events queues work without delivering raw instructions', async () => {
+      const event = {
+        recipient: 'tg:12345',
+        instruction: 'Prepare the morning briefing',
+        source: 'openclaw-bridge',
+      };
+      const res = await makeRequest(
+        testPort,
+        'POST',
+        '/api/v1/agent-events',
+        event,
+      );
+
+      expect(res).toEqual({
+        statusCode: 202,
+        body: { id: 'agent-event-1', status: 'queued-for-agent' },
+      });
+      expect(agentEventSink).toHaveBeenCalledWith(event);
+      expect(mockChannel.sendMessage).not.toHaveBeenCalled();
     });
 
     it('POST /api/v1/messages with alert template delivers formatted message', async () => {

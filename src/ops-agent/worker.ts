@@ -2,7 +2,7 @@
  * Ops-Agent Worker
  *
  * Long-lived process that polls Agency HQ for ops tasks (task_type=ops, status=ready),
- * executes them via the Claude Code CLI with full host access, and reports results back.
+ * executes them via the configured agent CLI with full host access, and reports results back.
  *
  * Unlike dev-inbox workers, this process is persistent and has access to operational
  * commands (systemctl, journalctl, df, ps, etc.).
@@ -137,6 +137,15 @@ export function buildCliArgs(config: ResolvedConfig, prompt: string): string[] {
         ...(config.model ? ['-m', config.model] : []),
         prompt,
       ];
+    case 'opencode':
+      return [
+        'run',
+        '--auto',
+        '--format',
+        'json',
+        ...(config.model ? ['--model', config.model] : []),
+        prompt,
+      ];
     case 'claude':
     default:
       return [
@@ -148,6 +157,41 @@ export function buildCliArgs(config: ResolvedConfig, prompt: string): string[] {
         prompt,
       ];
   }
+}
+
+/** Extract the human-facing final text from provider JSONL output. */
+export function normalizeCliOutput(provider: string, raw: string): string {
+  if (provider !== 'opencode' && provider !== 'codex') return raw.trim();
+
+  let output = '';
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    try {
+      const event = JSON.parse(line) as {
+        type?: string;
+        part?: { text?: string };
+        item?: { type?: string; text?: string };
+      };
+      if (
+        provider === 'opencode' &&
+        event.type === 'text' &&
+        event.part?.text
+      ) {
+        output += event.part.text;
+      }
+      if (
+        provider === 'codex' &&
+        event.type === 'item.completed' &&
+        event.item?.type === 'agent_message' &&
+        event.item.text
+      ) {
+        output = event.item.text;
+      }
+    } catch {
+      // Provider logs may include non-JSON diagnostics.
+    }
+  }
+  return output.trim() || raw.trim();
 }
 
 /**
@@ -215,7 +259,10 @@ export async function executeTask(
         toolLogger.processLine(stdoutBuffer);
       }
 
-      const stdout = Buffer.concat(stdoutChunks).toString('utf-8').trim();
+      const stdout = normalizeCliOutput(
+        config.provider,
+        Buffer.concat(stdoutChunks).toString('utf-8'),
+      );
       const stderr = Buffer.concat(stderrChunks).toString('utf-8').trim();
 
       if (abort.signal.aborted && code !== 0) {
@@ -243,7 +290,7 @@ export async function executeTask(
       resolve({ result: null, error: err.message });
     });
 
-    // Close stdin immediately — Claude CLI reads from args, not stdin
+    // Prompts are passed as arguments for each supported ops-agent CLI.
     proc.stdin.end();
   });
 }

@@ -103,16 +103,16 @@ describe('dispatch-config', () => {
       const resolved = resolveConfig(null);
 
       // These come from config.ts defaults
-      expect(resolved.provider).toBe('claude');
-      expect(resolved.cliBin).toBe('claude');
-      expect(resolved.model).toBeUndefined();
+      expect(resolved.provider).toBe('opencode');
+      expect(resolved.cliBin).toBe('opencode');
+      expect(resolved.model).toBe('opencode-go/deepseek-v4-flash');
     });
 
     it('falls back to env vars for missing API fields', () => {
       const resolved = resolveConfig({ provider: 'anthropic' });
 
       expect(resolved.provider).toBe('anthropic');
-      expect(resolved.cliBin).toBe('claude'); // default
+      expect(resolved.cliBin).toBe('opencode'); // env fallback
       expect(resolved.model).toBeUndefined(); // not set
     });
   });
@@ -120,9 +120,9 @@ describe('dispatch-config', () => {
   describe('getEffectiveConfig', () => {
     it('returns env defaults when no API config has been fetched', () => {
       const config = getEffectiveConfig();
-      expect(config.provider).toBe('claude');
-      expect(config.cliBin).toBe('claude');
-      expect(config.model).toBeUndefined();
+      expect(config.provider).toBe('opencode');
+      expect(config.cliBin).toBe('opencode');
+      expect(config.model).toBe('opencode-go/deepseek-v4-flash');
     });
 
     it('returns API config after refresh', async () => {
@@ -158,8 +158,8 @@ describe('dispatch-config', () => {
 
       // Falls back to defaults
       const config = getEffectiveConfig();
-      expect(config.provider).toBe('claude');
-      expect(config.model).toBeUndefined();
+      expect(config.provider).toBe('opencode');
+      expect(config.model).toBe('opencode-go/deepseek-v4-flash');
     });
   });
 
@@ -203,7 +203,7 @@ describe('dispatch-config', () => {
       expect(getEffectiveConfig().model).toBe('opus-4');
 
       _resetForTest();
-      expect(getEffectiveConfig().model).toBeUndefined();
+      expect(getEffectiveConfig().model).toBe('opencode-go/deepseek-v4-flash');
     });
   });
 });

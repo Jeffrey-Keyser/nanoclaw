@@ -1,6 +1,6 @@
 /**
  * Provider-agnostic runner backend interface.
- * Allows swapping Claude CLI for other providers (Codex, etc.) via env var.
+ * Allows swapping agent CLIs without coupling the host to one provider.
  */
 
 export interface RunOptions {

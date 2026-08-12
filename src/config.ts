@@ -143,9 +143,18 @@ export const NOTIFICATION_BATCH_WINDOW_INFO = parseInt(
   10,
 );
 
-// Provider-agnostic agent runner configuration.
-// AGENT_RUNNER_BACKEND selects the CLI backend (default: claude).
-// AGENT_CLI_BIN overrides the binary name/path for the selected backend.
+// Provider-agnostic agent runner configuration. These are global defaults;
+// groups may override them in groups/<folder>/container.json.
 export const AGENT_RUNNER_BACKEND =
-  process.env.AGENT_RUNNER_BACKEND || 'claude';
-export const AGENT_CLI_BIN = process.env.AGENT_CLI_BIN || 'claude';
+  process.env.AGENT_RUNNER_BACKEND || 'opencode';
+export const AGENT_CLI_BIN = process.env.AGENT_CLI_BIN || AGENT_RUNNER_BACKEND;
+export const AGENT_MODEL =
+  process.env.AGENT_MODEL ||
+  (AGENT_RUNNER_BACKEND === 'opencode' ? 'opencode-go/deepseek-v4-flash' : '');
+export const AGENT_FALLBACK_BACKEND =
+  process.env.AGENT_FALLBACK_BACKEND || 'codex';
+export const AGENT_FALLBACK_CLI_BIN =
+  process.env.AGENT_FALLBACK_CLI_BIN || AGENT_FALLBACK_BACKEND;
+export const AGENT_FALLBACK_MODEL =
+  process.env.AGENT_FALLBACK_MODEL ||
+  (AGENT_FALLBACK_BACKEND === 'codex' ? 'gpt-5.6-terra' : '');
