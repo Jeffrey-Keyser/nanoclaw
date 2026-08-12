@@ -363,7 +363,7 @@ describe('GroupQueue', () => {
     await vi.advanceTimersByTimeAsync(10);
   });
 
-  it('sendMessage resets idleWaiting so a subsequent task enqueue does not preempt', async () => {
+  it('sendMessage returns false for active message containers so follow-ups drain later', async () => {
     const fs = await import('fs');
     let resolveProcess: () => void;
 
@@ -384,23 +384,11 @@ describe('GroupQueue', () => {
       'test-group',
     );
 
-    // Container becomes idle
-    queue.notifyIdle('group1@g.us');
-
-    // A new user message arrives — resets idleWaiting
-    queue.sendMessage('group1@g.us', 'hello');
-
-    // Task enqueued after message reset — should NOT preempt (agent is working)
+    // A new user message cannot be piped into the one-shot runner.
     const writeFileSync = vi.mocked(fs.default.writeFileSync);
     writeFileSync.mockClear();
-
-    const taskFn = vi.fn(async () => {});
-    queue.enqueueTask('group1@g.us', 'task-1', taskFn);
-
-    const closeWrites = writeFileSync.mock.calls.filter(
-      (call) => typeof call[0] === 'string' && call[0].endsWith('_close'),
-    );
-    expect(closeWrites).toHaveLength(0);
+    expect(queue.sendMessage('group1@g.us', 'hello')).toBe(false);
+    expect(writeFileSync).not.toHaveBeenCalled();
 
     resolveProcess!();
     await vi.advanceTimersByTimeAsync(10);
