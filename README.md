@@ -164,6 +164,12 @@ When `NANOCLAW_SMOKE_RECIPIENT` is set in `.env`, `npm run build` runs this
 silent gate automatically after the restarted service becomes healthy. Set
 `NANOCLAW_SKIP_AGENT_EVENT_SMOKE=1` for an intentionally smoke-free reload.
 
+The external Agency HQ/dev-inbox pipeline owns task dispatch, while dev-inbox
+owns dispatch-slot lifecycle through the `slot.*` event stream. NanoClaw's older
+polling dispatcher is disabled by default. Set
+`NANOCLAW_LEGACY_AGENCY_DISPATCH=true` only on older installations that still
+expose the retired slot-write HTTP contract.
+
 `smoke:db-container` is the operational smoke test for the v2 DB-backed agent path. It:
 
 - injects a CLI-routed message into a live agent session without sending Telegram output

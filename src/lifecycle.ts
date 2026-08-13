@@ -52,6 +52,7 @@ import { startMessageApi, stopMessageApi } from './message-api.js';
 import { initSkillRegistry, shutdownSkillRegistry } from './skill-registry.js';
 import {
   startDispatchLoop,
+  isLegacyAgencyDispatchEnabled,
   startOpsWatchdog,
   startSprintRetroWatcherSubsystem,
   startStallDetector,
@@ -454,18 +455,26 @@ export async function initApp(): Promise<void> {
     state: 'running',
     details: 'Scheduled task polling active.',
   });
-  try {
-    await startDispatchLoop(schedulerDeps);
+  if (!isLegacyAgencyDispatchEnabled()) {
     setSubsystemState('agency-dispatch', {
-      state: 'running',
-      details: 'Agency HQ dispatch loop active.',
+      state: 'disabled',
+      details:
+        'External Agency HQ/dev-inbox pipeline owns dispatch; NanoClaw compatibility dispatcher is disabled.',
     });
-  } catch (err) {
-    setSubsystemState('agency-dispatch', {
-      state: 'degraded',
-      details: err instanceof Error ? err.message : 'Failed to start.',
-    });
-    logger.error({ err }, 'Failed to start dispatch loop');
+  } else {
+    try {
+      await startDispatchLoop(schedulerDeps);
+      setSubsystemState('agency-dispatch', {
+        state: 'running',
+        details: 'NanoClaw compatibility dispatch loop active.',
+      });
+    } catch (err) {
+      setSubsystemState('agency-dispatch', {
+        state: 'degraded',
+        details: err instanceof Error ? err.message : 'Failed to start.',
+      });
+      logger.error({ err }, 'Failed to start compatibility dispatch loop');
+    }
   }
   try {
     await startStallDetector(schedulerDeps, notificationBatcher);

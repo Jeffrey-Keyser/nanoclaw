@@ -39,11 +39,20 @@ import type { SchedulerDependencies } from './task-scheduler.js';
 // --- Module-level state ---
 
 let stopping = false;
+let dispatchLoopStarted = false;
 let dispatchIntervalHandle: ReturnType<typeof setInterval> | null = null;
 let stallIntervalHandle: ReturnType<typeof setInterval> | null = null;
 let stallNotificationBatcher: NotificationBatcher | undefined;
 
 const isStopping = () => stopping;
+
+/**
+ * Agency HQ is the production dispatch owner. NanoClaw's polling dispatcher is
+ * retained only as an explicit compatibility mode for older installations.
+ */
+export function isLegacyAgencyDispatchEnabled(): boolean {
+  return process.env.NANOCLAW_LEGACY_AGENCY_DISPATCH === 'true';
+}
 
 // --- Startup reconciliation ---
 
@@ -196,6 +205,7 @@ export async function startDispatchLoop(
   deps: SchedulerDependencies,
 ): Promise<void> {
   stopping = false;
+  dispatchLoopStarted = true;
   logger.info(
     { intervalMs: DISPATCH_LOOP_INTERVAL },
     'Starting Agency HQ dispatch loop',
@@ -355,12 +365,13 @@ export async function stopAgencyHqSubsystems(): Promise<void> {
   dispatchSkipTicks.clear();
   dispatchTime.clear();
 
-  // Graceful drain: wait for in-flight workers to complete.
-  // On timeout, remaining AHQ tasks are reverted to 'ready' and slots freed.
-  await drainSlots(DISPATCH_DRAIN_TIMEOUT_MS);
-
-  // Safety-net log for any slots still active (should be none after drain).
-  flushOnShutdown();
+  if (dispatchLoopStarted) {
+    // Only the compatibility dispatcher may drain its slots. Agency HQ's
+    // event-sourced slots are owned by dev-inbox and must not be mutated here.
+    await drainSlots(DISPATCH_DRAIN_TIMEOUT_MS);
+    flushOnShutdown();
+    dispatchLoopStarted = false;
+  }
   resetDispatchLoopState();
   logger.info('Agency HQ subsystems stopped');
 }
@@ -382,6 +393,7 @@ export const _testInternals = {
   findCeoJid,
   enableParallelDispatch,
   isParallelDispatchKillSwitchActive,
+  isLegacyAgencyDispatchEnabled,
   resetStopping: () => {
     stopping = false;
     resetDispatchLoopState();

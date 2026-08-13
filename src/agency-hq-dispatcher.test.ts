@@ -13,6 +13,7 @@ import {
   _testInternals,
   reconcileOrphanedDispatches,
   startDispatchLoop,
+  isLegacyAgencyDispatchEnabled,
   startStallDetector,
   stopAgencyHqSubsystems,
 } from './agency-hq-dispatcher.js';
@@ -923,6 +924,17 @@ describe('agency-hq-dispatcher', () => {
   });
 
   describe('lifecycle', () => {
+    it('defaults dispatch ownership to Agency HQ', () => {
+      delete process.env.NANOCLAW_LEGACY_AGENCY_DISPATCH;
+      expect(isLegacyAgencyDispatchEnabled()).toBe(false);
+    });
+
+    it('enables the compatibility dispatcher only when explicitly selected', () => {
+      process.env.NANOCLAW_LEGACY_AGENCY_DISPATCH = 'true';
+      expect(isLegacyAgencyDispatchEnabled()).toBe(true);
+      delete process.env.NANOCLAW_LEGACY_AGENCY_DISPATCH;
+    });
+
     it('starts and stops dispatch loop cleanly', async () => {
       const deps = makeMockDeps();
       await startDispatchLoop(deps);
