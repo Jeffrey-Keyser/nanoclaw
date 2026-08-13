@@ -16,7 +16,7 @@ function fetchHealth() {
         hostname: host,
         port,
         path: '/health',
-        timeout: Math.min(intervalMs, 5000),
+        timeout: Math.max(5000, Math.min(timeoutMs, 10000)),
       },
       (res) => {
         const chunks = [];

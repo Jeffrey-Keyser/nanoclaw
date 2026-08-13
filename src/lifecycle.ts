@@ -24,6 +24,8 @@ import {
   getAllSessions,
   getRouterState,
   initDatabase,
+  insertAgentEvent,
+  pruneAgentEvents,
   pruneToolEvents,
   setRegisteredGroup,
   setRouterState,
@@ -180,6 +182,8 @@ export async function initApp(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
 
+  pruneAgentEvents(7);
+
   // Prune stale tool call events on startup and every 6 hours
   const pruned = pruneToolEvents(7);
   if (pruned > 0) {
@@ -191,6 +195,13 @@ export async function initApp(): Promise<void> {
         const count = pruneToolEvents(7);
         if (count > 0) {
           logger.info({ pruned: count }, 'Periodic tool event cleanup');
+        }
+        const agentEventCount = pruneAgentEvents(7);
+        if (agentEventCount > 0) {
+          logger.info(
+            { pruned: agentEventCount },
+            'Periodic agent event cleanup',
+          );
         }
       } catch (err) {
         logger.warn({ err }, 'Tool event cleanup failed');
@@ -542,25 +553,51 @@ export async function initApp(): Promise<void> {
       () => channels,
       undefined,
       undefined,
-      ({ recipient, instruction, source }) => {
+      ({ recipient, instruction, source, delivery }) => {
         const group = state.registeredGroups[recipient];
         if (!group)
           throw new Error(`Recipient is not registered: ${recipient}`);
         const id = `agent-event-${crypto.randomUUID()}`;
+        const createdAt = new Date().toISOString();
+        const deliveryMode = delivery || 'channel';
+        const executionJid =
+          deliveryMode === 'capture'
+            ? `agent-event-capture:${recipient}`
+            : recipient;
         const content =
           !group.isMain && group.requiresTrigger !== false
             ? `${group.trigger} ${instruction}`
             : instruction;
+        if (deliveryMode === 'capture') {
+          storeChatMetadata(
+            executionJid,
+            createdAt,
+            `${group.name} provider diagnostic`,
+            'internal',
+            false,
+          );
+        }
+        insertAgentEvent({
+          id,
+          recipient,
+          executionJid,
+          source: source || 'external-agent-event',
+          deliveryMode,
+          createdAt,
+        });
         storeMessageDirect({
           id,
-          chat_jid: recipient,
+          chat_jid: executionJid,
           sender: source || 'external-agent-event',
           sender_name: source || 'External automation',
           content,
-          timestamp: new Date().toISOString(),
+          timestamp: createdAt,
           is_from_me: false,
           is_bot_message: false,
         });
+        if (deliveryMode === 'capture') {
+          queue.enqueueMessageCheck(executionJid);
+        }
         return id;
       },
     );

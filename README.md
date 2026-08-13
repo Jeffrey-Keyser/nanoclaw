@@ -157,8 +157,12 @@ npm run smoke:db-container
 `smoke:agent-event` is the live post-deployment gate for the provider-neutral
 agent path. It sends one unique canary through `/api/v1/agent-events`, waits for
 the runner to become active, queues a follow-up, and requires two exact outputs
-from separate runner invocations. An explicit recipient is required because the
-two canary replies are delivered to the configured channel.
+from separate runner invocations. Results are captured through
+`GET /api/v1/agent-events/:id` and are not delivered to the recipient's channel;
+the recipient selects which registered group's provider configuration to test.
+When `NANOCLAW_SMOKE_RECIPIENT` is set in `.env`, `npm run build` runs this
+silent gate automatically after the restarted service becomes healthy. Set
+`NANOCLAW_SKIP_AGENT_EVENT_SMOKE=1` for an intentionally smoke-free reload.
 
 `smoke:db-container` is the operational smoke test for the v2 DB-backed agent path. It:
 

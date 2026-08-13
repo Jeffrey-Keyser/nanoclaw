@@ -1,11 +1,9 @@
 import crypto from 'node:crypto';
-import fs from 'node:fs/promises';
 
 export interface AgentEventSmokeOptions {
   recipient: string;
   messageApiUrl: string;
   healthUrl: string;
-  logFile: string;
   timeoutMs: number;
   pollIntervalMs: number;
   runId?: string;
@@ -13,7 +11,6 @@ export interface AgentEventSmokeOptions {
 
 interface HealthSnapshot {
   status?: string;
-  runtime?: { activeSessionCount?: number };
   providers?: {
     primary?: { available?: boolean };
     fallback?: { available?: boolean };
@@ -26,14 +23,21 @@ interface AgentEventResponse {
   error?: string;
 }
 
+interface AgentEventStatusResponse extends AgentEventResponse {
+  delivery?: string;
+  execution_id?: string | null;
+  result?: string | null;
+}
+
 export interface AgentEventSmokeDependencies {
   fetchHealth: () => Promise<HealthSnapshot>;
   postAgentEvent: (body: {
     recipient: string;
     instruction: string;
     source: string;
+    delivery: 'capture';
   }) => Promise<AgentEventResponse>;
-  readNewLogs: () => Promise<string>;
+  getAgentEvent: (id: string) => Promise<AgentEventStatusResponse>;
   sleep: (ms: number) => Promise<void>;
 }
 
@@ -91,81 +95,93 @@ export async function runAgentEventSmoke(
     throw new Error('NanoClaw has no available agent provider');
   }
 
-  const eventIds: string[] = [];
   const firstResponse = await dependencies.postAgentEvent({
     recipient: options.recipient,
     instruction: agentInstruction(firstOutput),
     source,
+    delivery: 'capture',
   });
   if (firstResponse.status !== 'queued-for-agent' || !firstResponse.id) {
     throw new Error(
       `First event was not queued: ${JSON.stringify(firstResponse)}`,
     );
   }
-  eventIds.push(firstResponse.id);
 
   await waitUntil(
-    'the first agent runner to become active',
+    'the first captured event to enter a runner',
     deadline,
     options.pollIntervalMs,
     dependencies.sleep,
     async () =>
-      ((await dependencies.fetchHealth()).runtime?.activeSessionCount ?? 0) > 0,
+      (await dependencies.getAgentEvent(firstResponse.id!)).status ===
+      'running',
   );
 
-  // This event is intentionally submitted while the first one is active. A
-  // one-shot provider must drain it through a fresh invocation.
+  // Intentionally submit while the first event is running. A one-shot
+  // provider must drain this through a fresh invocation.
   const followUpResponse = await dependencies.postAgentEvent({
     recipient: options.recipient,
     instruction: agentInstruction(followUpOutput),
     source,
+    delivery: 'capture',
   });
   if (followUpResponse.status !== 'queued-for-agent' || !followUpResponse.id) {
     throw new Error(
       `Follow-up event was not queued: ${JSON.stringify(followUpResponse)}`,
     );
   }
-  eventIds.push(followUpResponse.id);
 
-  let logs = '';
+  let firstEvent: AgentEventStatusResponse | undefined;
+  let followUpEvent: AgentEventStatusResponse | undefined;
   await waitUntil(
-    'both exact canary outputs from separate runner invocations',
+    'both captured canary results',
     deadline,
     options.pollIntervalMs,
     dependencies.sleep,
     async () => {
-      logs += await dependencies.readNewLogs();
-      const invocationCount = (logs.match(/Spawning tmux agent session/g) || [])
-        .length;
+      [firstEvent, followUpEvent] = await Promise.all([
+        dependencies.getAgentEvent(firstResponse.id!),
+        dependencies.getAgentEvent(followUpResponse.id!),
+      ]);
       return (
-        logs.includes(`Agent output: ${firstOutput}`) &&
-        logs.includes(`Agent output: ${followUpOutput}`) &&
-        invocationCount >= 2
+        firstEvent.status === 'completed' &&
+        followUpEvent.status === 'completed'
       );
     },
   );
 
-  if (logs.includes('Agent output: Agent-event deployment canary.')) {
-    throw new Error('Raw canary instructions were emitted as agent output');
+  if (firstEvent?.result !== firstOutput) {
+    throw new Error(
+      `Unexpected first canary result: ${JSON.stringify(firstEvent?.result)}`,
+    );
+  }
+  if (followUpEvent?.result !== followUpOutput) {
+    throw new Error(
+      `Unexpected follow-up canary result: ${JSON.stringify(followUpEvent?.result)}`,
+    );
+  }
+  if (
+    !firstEvent.execution_id ||
+    !followUpEvent.execution_id ||
+    firstEvent.execution_id === followUpEvent.execution_id
+  ) {
+    throw new Error(
+      'Canary follow-up did not use a separate runner invocation',
+    );
   }
 
-  const runnerInvocations = (logs.match(/Spawning tmux agent session/g) || [])
-    .length;
   return {
     runId,
-    eventIds: eventIds as [string, string],
+    eventIds: [firstResponse.id, followUpResponse.id],
     outputs: [firstOutput, followUpOutput],
-    runnerInvocations,
+    runnerInvocations: 2,
     durationMs: Date.now() - startedAt,
   };
 }
 
 export function createLiveSmokeDependencies(options: AgentEventSmokeOptions): {
   dependencies: AgentEventSmokeDependencies;
-  initialize: () => Promise<void>;
 } {
-  let logOffset = 0;
-
   async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
     const response = await fetch(url, init);
     const body = (await response.json()) as unknown;
@@ -178,9 +194,6 @@ export function createLiveSmokeDependencies(options: AgentEventSmokeOptions): {
   }
 
   return {
-    initialize: async () => {
-      logOffset = (await fs.stat(options.logFile)).size;
-    },
     dependencies: {
       fetchHealth: async () =>
         (await fetchJson(options.healthUrl)) as HealthSnapshot,
@@ -190,20 +203,10 @@ export function createLiveSmokeDependencies(options: AgentEventSmokeOptions): {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify(body),
         })) as AgentEventResponse,
-      readNewLogs: async () => {
-        const handle = await fs.open(options.logFile, 'r');
-        try {
-          const size = (await handle.stat()).size;
-          if (size < logOffset) logOffset = 0;
-          if (size === logOffset) return '';
-          const buffer = Buffer.alloc(size - logOffset);
-          await handle.read(buffer, 0, buffer.length, logOffset);
-          logOffset = size;
-          return buffer.toString('utf8');
-        } finally {
-          await handle.close();
-        }
-      },
+      getAgentEvent: async (id) =>
+        (await fetchJson(
+          `${options.messageApiUrl}/api/v1/agent-events/${encodeURIComponent(id)}`,
+        )) as AgentEventStatusResponse,
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
     },
   };

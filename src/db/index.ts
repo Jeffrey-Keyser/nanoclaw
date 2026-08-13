@@ -4,6 +4,7 @@ import path from 'path';
 
 import { STORE_DIR } from '../config.js';
 
+import { _setAgentEventsDb } from './agent-events.js';
 import { _setDispatchSlotsDb } from './dispatch-slots.js';
 import { _setGroupsDb } from './groups.js';
 import { _setMessagesDb } from './messages.js';
@@ -14,6 +15,7 @@ import { _setTasksDb } from './tasks.js';
 import { _setToolEventsDb } from './tool-events.js';
 
 function setAllDbs(database: Database.Database): void {
+  _setAgentEventsDb(database);
   _setMessagesDb(database);
   _setSessionsDb(database);
   _setGroupsDb(database);
@@ -44,6 +46,21 @@ export function _initTestDatabase(): void {
 }
 
 // Re-export everything from domain modules
+export {
+  AgentEvent,
+  AgentEventDeliveryMode,
+  AgentEventStatus,
+  completeAgentEvents,
+  failAgentEvents,
+  getAgentEvent,
+  getAgentEvents,
+  getCaptureTarget,
+  insertAgentEvent,
+  markAgentEventsRunning,
+  pruneAgentEvents,
+  recoverCaptureAgentEvents,
+} from './agent-events.js';
+
 export {
   ChatInfo,
   getAllChats,

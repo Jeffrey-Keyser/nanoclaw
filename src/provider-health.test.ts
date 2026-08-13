@@ -46,4 +46,14 @@ describe('provider health diagnostics', () => {
       error: 'spawn missing ENOENT',
     });
   });
+
+  it('checks absolute provider binaries without executing them', () => {
+    expect(checkProvider('opencode', 'test-model', '/bin/sh')).toMatchObject({
+      available: true,
+      binary: '/bin/sh',
+      version: null,
+      error: null,
+    });
+    expect(spawnSync).not.toHaveBeenCalled();
+  });
 });

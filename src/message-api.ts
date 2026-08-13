@@ -15,6 +15,7 @@ import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import {
   countRecentMessages,
   getBatchedMessages,
+  getAgentEvent,
   listToolEventsForAgencyHq,
   getOutboundMessage,
   insertOutboundMessage,
@@ -89,6 +90,7 @@ interface AgentEventRequest {
   recipient: string;
   instruction: string;
   source?: string;
+  delivery?: 'channel' | 'capture';
 }
 
 export type AgentEventSink = (
@@ -114,12 +116,21 @@ export function validateAgentEventRequest(
   if (obj.source !== undefined && typeof obj.source !== 'string') {
     return { ok: false, error: 'source must be a string' };
   }
+  if (
+    obj.delivery !== undefined &&
+    obj.delivery !== 'channel' &&
+    obj.delivery !== 'capture'
+  ) {
+    return { ok: false, error: 'delivery must be channel or capture' };
+  }
   return {
     ok: true,
     data: {
       recipient: obj.recipient,
       instruction: obj.instruction,
       source: (obj.source as string | undefined) || 'external-agent-event',
+      delivery:
+        (obj.delivery as 'channel' | 'capture' | undefined) || 'channel',
     },
   };
 }
@@ -525,6 +536,26 @@ function handleGetToolEvents(req: IncomingMessage, res: ServerResponse): void {
   jsonResponse(res, 200, listToolEventsForAgencyHq(validation.data));
 }
 
+function handleGetAgentEvent(id: string, res: ServerResponse): void {
+  const event = getAgentEvent(id);
+  if (!event) {
+    jsonResponse(res, 404, { error: 'Agent event not found' });
+    return;
+  }
+  jsonResponse(res, 200, {
+    id: event.id,
+    recipient: event.recipient,
+    source: event.source,
+    delivery: event.delivery_mode,
+    status: event.status,
+    execution_id: event.execution_id,
+    result: event.result,
+    error: event.error,
+    created_at: event.created_at,
+    updated_at: event.updated_at,
+  });
+}
+
 // --- Server ---
 
 let httpServer: Server | null = null;
@@ -551,6 +582,17 @@ export function startMessageApi(
           } catch (err) {
             logger.error({ err }, 'Unhandled error in tool events API');
             jsonResponse(res, 500, { error: 'Internal server error' });
+          }
+          return;
+        }
+        if (requestUrl.pathname.startsWith('/api/v1/agent-events/')) {
+          const id = decodeURIComponent(
+            requestUrl.pathname.slice('/api/v1/agent-events/'.length),
+          );
+          if (!id) {
+            jsonResponse(res, 400, { error: 'Agent event ID required' });
+          } else {
+            handleGetAgentEvent(id, res);
           }
           return;
         }

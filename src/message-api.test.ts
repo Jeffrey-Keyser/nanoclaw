@@ -6,6 +6,8 @@ import {
   getOutboundMessage,
   insertOutboundMessage,
   countRecentMessages,
+  completeAgentEvents,
+  insertAgentEvent,
   insertToolCallEvent,
 } from './db/index.js';
 import {
@@ -189,6 +191,7 @@ describe('message-api', () => {
           recipient: 'tg:123',
           instruction: 'Prepare the morning briefing',
           source: 'openclaw-bridge',
+          delivery: 'channel',
         },
       });
     });
@@ -301,8 +304,58 @@ describe('message-api', () => {
         statusCode: 202,
         body: { id: 'agent-event-1', status: 'queued-for-agent' },
       });
-      expect(agentEventSink).toHaveBeenCalledWith(event);
+      expect(agentEventSink).toHaveBeenCalledWith({
+        ...event,
+        delivery: 'channel',
+      });
       expect(mockChannel.sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('accepts capture delivery and exposes durable event status', async () => {
+      const createdAt = new Date().toISOString();
+      insertAgentEvent({
+        id: 'agent-event-captured',
+        recipient: 'tg:12345',
+        executionJid: 'agent-event-capture:tg:12345',
+        source: 'deployment-canary',
+        deliveryMode: 'capture',
+        createdAt,
+      });
+      completeAgentEvents(['agent-event-captured'], 'CANARY_OK');
+
+      const response = await makeRequest(
+        testPort,
+        'GET',
+        '/api/v1/agent-events/agent-event-captured',
+      );
+
+      expect(response).toMatchObject({
+        statusCode: 200,
+        body: {
+          id: 'agent-event-captured',
+          delivery: 'capture',
+          status: 'completed',
+          result: 'CANARY_OK',
+        },
+      });
+    });
+
+    it('rejects unsupported agent event delivery modes', async () => {
+      const response = await makeRequest(
+        testPort,
+        'POST',
+        '/api/v1/agent-events',
+        {
+          recipient: 'tg:12345',
+          instruction: 'test',
+          delivery: 'webhook',
+        },
+      );
+
+      expect(response).toEqual({
+        statusCode: 400,
+        body: { error: 'delivery must be channel or capture' },
+      });
     });
 
     it('POST /api/v1/messages with alert template delivers formatted message', async () => {

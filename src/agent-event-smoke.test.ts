@@ -10,123 +10,109 @@ const options: AgentEventSmokeOptions = {
   recipient: 'tg:123',
   messageApiUrl: 'http://127.0.0.1:3102',
   healthUrl: 'http://127.0.0.1:3101/health',
-  logFile: '/tmp/nanoclaw-test.log',
   timeoutMs: 5_000,
   pollIntervalMs: 0,
   runId: 'TEST_RUN',
 };
 
+function successfulDependencies(
+  overrides: {
+    firstResult?: string;
+    followUpResult?: string;
+    followUpExecutionId?: string;
+    primaryAvailable?: boolean;
+    fallbackAvailable?: boolean;
+  } = {},
+): AgentEventSmokeDependencies {
+  let postCount = 0;
+  let firstStatusReads = 0;
+  return {
+    fetchHealth: vi.fn(async () => ({
+      status: 'ok',
+      providers: {
+        primary: { available: overrides.primaryAvailable ?? true },
+        fallback: { available: overrides.fallbackAvailable ?? true },
+      },
+    })),
+    postAgentEvent: vi.fn(async () => {
+      postCount += 1;
+      return { id: `event-${postCount}`, status: 'queued-for-agent' };
+    }),
+    getAgentEvent: vi.fn(async (id: string) => {
+      if (id === 'event-1' && firstStatusReads++ === 0) {
+        return { id, status: 'running', execution_id: 'runner-1' };
+      }
+      if (id === 'event-1') {
+        return {
+          id,
+          status: 'completed',
+          execution_id: 'runner-1',
+          result: overrides.firstResult ?? 'NANOCLAW_CANARY_TEST_RUN_FIRST',
+        };
+      }
+      return {
+        id,
+        status: 'completed',
+        execution_id: overrides.followUpExecutionId ?? 'runner-2',
+        result:
+          overrides.followUpResult ?? 'NANOCLAW_CANARY_TEST_RUN_FOLLOW_UP',
+      };
+    }),
+    sleep: vi.fn(async () => undefined),
+  };
+}
+
 describe('agent event deployment smoke', () => {
-  it('queues a follow-up while active and requires two exact outputs', async () => {
-    let postCount = 0;
-    const dependencies: AgentEventSmokeDependencies = {
-      fetchHealth: vi
-        .fn()
-        .mockResolvedValueOnce({
-          status: 'ok',
-          providers: { primary: { available: true } },
-          runtime: { activeSessionCount: 0 },
-        })
-        .mockResolvedValue({
-          status: 'ok',
-          providers: { primary: { available: true } },
-          runtime: { activeSessionCount: 1 },
-        }),
-      postAgentEvent: vi.fn(async () => {
-        postCount += 1;
-        return { id: `event-${postCount}`, status: 'queued-for-agent' };
-      }),
-      readNewLogs: vi.fn(async () =>
-        [
-          'Spawning tmux agent session',
-          'Agent output: NANOCLAW_CANARY_TEST_RUN_FIRST',
-          'Spawning tmux agent session',
-          'Agent output: NANOCLAW_CANARY_TEST_RUN_FOLLOW_UP',
-        ].join('\n'),
-      ),
-      sleep: vi.fn(async () => undefined),
-    };
+  it('captures a follow-up through a separate runner without channel delivery', async () => {
+    const dependencies = successfulDependencies();
 
     const result = await runAgentEventSmoke(options, dependencies);
 
     expect(result.eventIds).toEqual(['event-1', 'event-2']);
     expect(result.runnerInvocations).toBe(2);
     expect(dependencies.postAgentEvent).toHaveBeenCalledTimes(2);
+    expect(dependencies.postAgentEvent).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ delivery: 'capture' }),
+    );
   });
 
-  it('rejects a raw instruction echo', async () => {
-    const dependencies: AgentEventSmokeDependencies = {
-      fetchHealth: vi.fn(async () => ({
-        status: 'ok',
-        providers: { primary: { available: true } },
-        runtime: { activeSessionCount: 1 },
-      })),
-      postAgentEvent: vi
-        .fn()
-        .mockResolvedValueOnce({ id: 'event-1', status: 'queued-for-agent' })
-        .mockResolvedValueOnce({ id: 'event-2', status: 'queued-for-agent' }),
-      readNewLogs: vi.fn(async () =>
-        [
-          'Spawning tmux agent session',
-          'Agent output: NANOCLAW_CANARY_TEST_RUN_FIRST',
-          'Spawning tmux agent session',
-          'Agent output: NANOCLAW_CANARY_TEST_RUN_FOLLOW_UP',
-          'Agent output: Agent-event deployment canary.',
-        ].join('\n'),
-      ),
-      sleep: vi.fn(async () => undefined),
-    };
+  it('rejects an unexpected captured result', async () => {
+    const dependencies = successfulDependencies({
+      firstResult: 'Agent-event deployment canary. Reply with exactly ...',
+    });
 
     await expect(runAgentEventSmoke(options, dependencies)).rejects.toThrow(
-      'Raw canary instructions were emitted',
+      'Unexpected first canary result',
+    );
+  });
+
+  it('requires a fresh invocation for the queued follow-up', async () => {
+    const dependencies = successfulDependencies({
+      followUpExecutionId: 'runner-1',
+    });
+
+    await expect(runAgentEventSmoke(options, dependencies)).rejects.toThrow(
+      'separate runner invocation',
     );
   });
 
   it('continues when only the fallback provider is available', async () => {
-    const dependencies: AgentEventSmokeDependencies = {
-      fetchHealth: vi.fn(async () => ({
-        status: 'ok',
-        providers: {
-          primary: { available: false },
-          fallback: { available: true },
-        },
-        runtime: { activeSessionCount: 1 },
-      })),
-      postAgentEvent: vi
-        .fn()
-        .mockResolvedValueOnce({ id: 'event-1', status: 'queued-for-agent' })
-        .mockResolvedValueOnce({ id: 'event-2', status: 'queued-for-agent' }),
-      readNewLogs: vi.fn(async () =>
-        [
-          'Spawning tmux agent session',
-          'Agent output: NANOCLAW_CANARY_TEST_RUN_FIRST',
-          'Spawning tmux agent session',
-          'Agent output: NANOCLAW_CANARY_TEST_RUN_FOLLOW_UP',
-        ].join('\n'),
-      ),
-      sleep: vi.fn(async () => undefined),
-    };
+    const dependencies = successfulDependencies({
+      primaryAvailable: false,
+      fallbackAvailable: true,
+    });
 
     await expect(
       runAgentEventSmoke(options, dependencies),
-    ).resolves.toMatchObject({
-      eventIds: ['event-1', 'event-2'],
-    });
+    ).resolves.toMatchObject({ runnerInvocations: 2 });
   });
 
   it('fails before sending when every provider is unavailable', async () => {
-    const dependencies: AgentEventSmokeDependencies = {
-      fetchHealth: vi.fn(async () => ({
-        status: 'ok',
-        providers: {
-          primary: { available: false },
-          fallback: { available: false },
-        },
-      })),
-      postAgentEvent: vi.fn(),
-      readNewLogs: vi.fn(),
-      sleep: vi.fn(async () => undefined),
-    };
+    const dependencies = successfulDependencies({
+      primaryAvailable: false,
+      fallbackAvailable: false,
+    });
 
     await expect(runAgentEventSmoke(options, dependencies)).rejects.toThrow(
       'no available agent provider',

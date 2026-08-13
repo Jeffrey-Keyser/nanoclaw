@@ -43,9 +43,15 @@ npm run smoke:health
 NANOCLAW_SMOKE_RECIPIENT='tg:123456789' npm run smoke:agent-event
 ```
 
-The agent-event smoke invokes a real provider and delivers two unique canary
-replies. It also verifies that an event queued during an active one-shot runner
-is drained through a second invocation. Use a registered diagnostic recipient.
+The agent-event smoke invokes a real provider and captures two unique results
+without delivering them to the recipient's channel. It also verifies that an
+event queued during an active one-shot runner is drained through a second
+invocation. Use a registered recipient whose provider configuration should be
+tested.
+
+Set `NANOCLAW_SMOKE_RECIPIENT` in `.env` to run this gate automatically after
+`npm run build` restarts the service. For emergency reloads where provider work
+must not be invoked, set `NANOCLAW_SKIP_AGENT_EVENT_SMOKE=1`.
 
 ## Common Failure Modes
 

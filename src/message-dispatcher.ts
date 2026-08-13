@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import fs from 'fs';
 import path from 'path';
 import {
   ASSISTANT_NAME,
@@ -17,9 +18,15 @@ import {
 } from './container-runner.js';
 import {
   getAllTasks,
+  completeAgentEvents,
+  failAgentEvents,
+  getAgentEvents,
+  getCaptureTarget,
   getMessagesSince,
   getNewMessages,
   deleteSession,
+  markAgentEventsRunning,
+  recoverCaptureAgentEvents,
   setSession,
 } from './db/index.js';
 import { findChannel, formatMessages } from './router.js';
@@ -45,16 +52,51 @@ import {
 
 let messageLoopRunning = false;
 
+function createDiagnosticGroup(group: RegisteredGroup): RegisteredGroup {
+  let folderConfig: RegisteredGroup['containerConfig'] = {};
+  try {
+    folderConfig = JSON.parse(
+      fs.readFileSync(
+        path.join(resolveGroupFolderPath(group.folder), 'container.json'),
+        'utf8',
+      ),
+    ) as RegisteredGroup['containerConfig'];
+  } catch {
+    // Registered and global provider configuration remain available.
+  }
+  return {
+    ...group,
+    name: `${group.name} provider diagnostic`,
+    folder: `diagnostic-${group.folder}`.slice(0, 64),
+    requiresTrigger: false,
+    isMain: false,
+    containerConfig: {
+      ...group.containerConfig,
+      ...folderConfig,
+      additionalMounts: [],
+      mcpCredentialMounts: [],
+      assistantName: 'Provider diagnostic',
+    },
+  };
+}
+
 /**
  * Process all pending messages for a group.
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = state.registeredGroups[chatJid];
-  if (!group) return true;
+  const captureTarget = getCaptureTarget(chatJid);
+  const registeredGroup = state.registeredGroups[captureTarget || chatJid];
+  if (!registeredGroup) return true;
+  const isCaptureExecution = captureTarget !== undefined;
+  const group = isCaptureExecution
+    ? createDiagnosticGroup(registeredGroup)
+    : registeredGroup;
 
-  const channel = findChannel(channels, chatJid);
-  if (!channel) {
+  const channel = isCaptureExecution
+    ? undefined
+    : findChannel(channels, chatJid);
+  if (!isCaptureExecution && !channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
     return true;
   }
@@ -70,6 +112,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   if (missedMessages.length === 0) return true;
 
+  const agentEvents = getAgentEvents(
+    missedMessages.map((message) => message.id),
+  );
+  const agentEventIds = agentEvents.map((event) => event.id);
+
   // --- Session command interception (before trigger check) ---
   const cmdResult = await handleSessionCommand({
     missedMessages,
@@ -78,9 +125,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     triggerPattern: TRIGGER_PATTERN,
     timezone: TIMEZONE,
     deps: {
-      sendMessage: (text) => channel.sendMessage(chatJid, text),
+      sendMessage: (text) =>
+        channel?.sendMessage(chatJid, text) ?? Promise.resolve(),
       setTyping: (typing) =>
-        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+        channel?.setTyping?.(chatJid, typing) ?? Promise.resolve(),
       runAgent: (prompt, onOutput) =>
         runAgent(group, prompt, chatJid, onOutput),
       closeStdin: () => queue.closeStdin(chatJid),
@@ -115,7 +163,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // --- End session command interception ---
 
   // For non-main groups, check if trigger is required and present
-  if (!isMainGroup && group.requiresTrigger !== false) {
+  if (!isCaptureExecution && !isMainGroup && group.requiresTrigger !== false) {
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
@@ -126,6 +174,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const correlationId = generateCorrelationId();
+  markAgentEventsRunning(agentEventIds, correlationId);
   const log = createCorrelationLogger(correlationId, {
     op: 'process-messages',
     group: group.name,
@@ -155,9 +204,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  await channel?.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
+  const capturedOutputs: string[] = [];
 
   // Deduplication guard: track content hashes of results already dispatched
   // in this invocation. The SDK may emit duplicate result events; only the
@@ -185,8 +235,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             log.warn('Duplicate SDK result event detected, skipping send');
           } else {
             seenResultHashes.add(hash);
-            await channel.sendMessage(chatJid, text);
-            outputSentToUser = true;
+            capturedOutputs.push(text);
+            if (!isCaptureExecution) {
+              await channel!.sendMessage(chatJid, text);
+              outputSentToUser = true;
+            }
           }
         }
         // Only reset idle timer on actual results, not session-update markers (result: null)
@@ -204,10 +257,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     correlationId,
   );
 
-  await channel.setTyping?.(chatJid, false);
+  await channel?.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
+    failAgentEvents(agentEventIds, 'Agent provider execution failed');
     // If we already sent output to the user, don't roll back the cursor —
     // the user got their response and re-processing would send duplicates.
     if (outputSentToUser) {
@@ -225,6 +279,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   // Persist the cursor now that processing succeeded
+  completeAgentEvents(
+    agentEventIds,
+    capturedOutputs.length > 0 ? capturedOutputs.join('\n') : null,
+  );
   saveState();
   return true;
 }
@@ -467,6 +525,13 @@ export function recoverPendingMessages(): void {
       );
       queue.enqueueMessageCheck(chatJid);
     }
+  }
+  for (const executionJid of recoverCaptureAgentEvents()) {
+    logger.info(
+      { executionJid },
+      'Recovery: found pending captured agent event',
+    );
+    queue.enqueueMessageCheck(executionJid);
   }
 }
 
