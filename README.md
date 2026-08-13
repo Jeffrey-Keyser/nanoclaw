@@ -150,8 +150,15 @@ These handle worktree conflicts, missing commits, API retries, CI wait logic, an
 ```bash
 npm run smoke:runtime
 npm run smoke:health
+NANOCLAW_SMOKE_RECIPIENT='tg:123456789' npm run smoke:agent-event
 npm run smoke:db-container
 ```
+
+`smoke:agent-event` is the live post-deployment gate for the provider-neutral
+agent path. It sends one unique canary through `/api/v1/agent-events`, waits for
+the runner to become active, queues a follow-up, and requires two exact outputs
+from separate runner invocations. An explicit recipient is required because the
+two canary replies are delivered to the configured channel.
 
 `smoke:db-container` is the operational smoke test for the v2 DB-backed agent path. It:
 

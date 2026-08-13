@@ -40,7 +40,12 @@ After restart, verify:
 
 ```bash
 npm run smoke:health
+NANOCLAW_SMOKE_RECIPIENT='tg:123456789' npm run smoke:agent-event
 ```
+
+The agent-event smoke invokes a real provider and delivers two unique canary
+replies. It also verifies that an event queued during an active one-shot runner
+is drained through a second invocation. Use a registered diagnostic recipient.
 
 ## Common Failure Modes
 
