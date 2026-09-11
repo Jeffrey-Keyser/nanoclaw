@@ -28,10 +28,6 @@ import {
   startOpsAgentWatchdog,
   stopOpsAgentWatchdog,
 } from './ops-agent-watchdog.js';
-import {
-  startSprintRetroWatcher,
-  stopSprintRetroWatcher,
-} from './sprint-retro-watcher.js';
 import { createCorrelationLogger, logger } from './logger.js';
 import type { NotificationBatcher } from './notification-batcher.js';
 import type { SchedulerDependencies } from './task-scheduler.js';
@@ -341,12 +337,6 @@ export function startOpsWatchdog(
   startOpsAgentWatchdog(deps, isStopping, notificationBatcher);
 }
 
-export async function startSprintRetroWatcherSubsystem(
-  deps: SchedulerDependencies,
-): Promise<void> {
-  startSprintRetroWatcher(deps);
-}
-
 export async function stopAgencyHqSubsystems(): Promise<void> {
   // Stop new slot acquisition immediately.
   stopping = true;
@@ -358,7 +348,6 @@ export async function stopAgencyHqSubsystems(): Promise<void> {
     clearInterval(stallIntervalHandle);
     stallIntervalHandle = null;
   }
-  stopSprintRetroWatcher();
   stopOpsAgentWatchdog();
   stallNotificationBatcher = undefined;
   dispatchRetryCount.clear();

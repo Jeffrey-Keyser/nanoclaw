@@ -54,7 +54,6 @@ import {
   startDispatchLoop,
   isLegacyAgencyDispatchEnabled,
   startOpsWatchdog,
-  startSprintRetroWatcherSubsystem,
   startStallDetector,
   stopAgencyHqSubsystems,
 } from './agency-hq-dispatcher.js';
@@ -493,13 +492,6 @@ export async function initApp(): Promise<void> {
   setSubsystemState('ops-watchdog', {
     state: 'running',
     details: 'Dispatch slot watchdog active (every 15 min).',
-  });
-  startSprintRetroWatcherSubsystem(schedulerDeps).catch((err) =>
-    logger.error({ err }, 'Failed to start sprint retro watcher'),
-  );
-  setSubsystemState('sprint-retro-watcher', {
-    state: 'running',
-    details: 'Polling hourly; sends messages only on sprint status changes.',
   });
   startUptimeMonitor({
     registeredGroups: () => state.registeredGroups,

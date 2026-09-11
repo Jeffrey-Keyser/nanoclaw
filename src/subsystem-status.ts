@@ -94,13 +94,6 @@ const subsystemDefaults: Array<Omit<SubsystemStatus, 'updatedAt'>> = [
     details: 'Used by /clear archival flows.',
   },
   {
-    id: 'sprint-retro-watcher',
-    label: 'Sprint retro watcher',
-    classification: 'internal',
-    state: 'disabled',
-    details: 'Not started yet.',
-  },
-  {
     id: 'message-api',
     label: 'Message API',
     classification: 'production',
