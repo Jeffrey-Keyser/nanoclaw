@@ -51,6 +51,12 @@ export class CodexCliBackend implements RunnerBackend {
       for (const dir of options.additionalDirs) args.push('--add-dir', dir);
     }
     if (options.model) args.push('--model', options.model);
+    const effort = options.env.AGENT_THINKING_LEVEL;
+    if (effort) {
+      if (!['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(effort))
+        throw new Error('Invalid reasoning level');
+      args.push('-c', `model_reasoning_effort=${tomlString(effort)}`);
+    }
     if (options.sessionId) args.push(options.sessionId);
     args.push('-');
 

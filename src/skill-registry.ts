@@ -1,3 +1,4 @@
+import { conversationModelStatus } from './conversation-models.js';
 /**
  * Skill Registry — discovers and registers agent skills from container/skills/.
  *
@@ -193,6 +194,18 @@ export function startSkillServer(
 ): Promise<Server> {
   return new Promise((resolve, reject) => {
     httpServer = createServer((req, res) => {
+      if (req.method === 'GET' && req.url === '/model-status') {
+        conversationModelStatus()
+          .then((data) => {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(data));
+          })
+          .catch(() => {
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'Model status unavailable' }));
+          });
+        return;
+      }
       if (req.method === 'GET' && req.url === '/skills') {
         const skills = getRegisteredSkills().map(
           ({ name, description, file, registeredAt }) => ({

@@ -23,6 +23,7 @@ interface ContainerInput {
 }
 
 interface ContainerOutput {
+  execution?: { provider: string; model: string; fallback: boolean };
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
@@ -130,6 +131,7 @@ async function main(): Promise<void> {
       status: result.exitCode === 0 ? 'success' : 'error',
       result: result.output,
       newSessionId: result.newSessionId,
+      execution: result.execution,
       error:
         result.exitCode === 0
           ? undefined

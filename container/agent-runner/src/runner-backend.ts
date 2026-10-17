@@ -14,6 +14,7 @@ export interface RunOptions {
 }
 
 export interface RunResult {
+  execution?: { provider: string; model: string; fallback: boolean };
   output: string | null;
   newSessionId?: string;
   exitCode: number;
