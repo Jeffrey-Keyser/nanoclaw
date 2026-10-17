@@ -4,6 +4,11 @@ import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+vi.mock('./conversation-models.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('./conversation-models.js')>()),
+  lookupConversationModel: async () => ({ state: 'missing' }),
+}));
+
 // Mock config
 vi.mock('./config.js', () => ({
   AGENT_CLI_BIN: 'opencode',

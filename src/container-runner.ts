@@ -1,3 +1,10 @@
+import {
+  applyConversationModel,
+  lookupConversationModel,
+  groupConfiguration,
+  recordConversationModel,
+  type ModelExecution,
+} from './conversation-models.js';
 /**
  * Session Runner for NanoClaw
  * Orchestrates agent execution in tmux sessions — delegates output polling
@@ -49,6 +56,7 @@ export interface ContainerInput {
 }
 
 export interface ContainerOutput {
+  execution?: ModelExecution;
   status: 'success' | 'error';
   result: string | null;
   newSessionId?: string;
@@ -198,21 +206,7 @@ export async function runContainerAgent(
   // Runtime/provider configuration is durable in the group folder so it can
   // be changed without rewriting registration rows. Registration-level
   // settings (notably mounts) remain the base and folder config overrides it.
-  try {
-    const folderConfigPath = path.join(
-      resolveGroupFolderPath(group.folder),
-      'container.json',
-    );
-    const folderConfig = JSON.parse(
-      fs.readFileSync(folderConfigPath, 'utf8'),
-    ) as RegisteredGroup['containerConfig'];
-    group = {
-      ...group,
-      containerConfig: { ...group.containerConfig, ...folderConfig },
-    };
-  } catch {
-    // Missing/invalid folder config falls back to registered + global config.
-  }
+  group = { ...group, containerConfig: groupConfiguration(group) };
 
   const startTime = Date.now();
   const cid = correlationId ?? generateCorrelationId();
@@ -258,43 +252,30 @@ export async function runContainerAgent(
   const outputFile = path.join(tmpDir, `output-${sessionName}.log`);
   const stderrFile = path.join(tmpDir, `stderr-${sessionName}.log`);
 
+  // Build environment for the session
+  const sessionEnv = buildSessionEnv(mounts);
+  const modelSelection = applyConversationModel(
+    sessionEnv,
+    group.containerConfig,
+    await lookupConversationModel(),
+  );
+  // Validate selectors before persisting the prompt or starting a session.
   fs.writeFileSync(inputFile, JSON.stringify(input));
   fs.writeFileSync(outputFile, ''); // Create empty output file
   fs.writeFileSync(stderrFile, ''); // Create empty stderr file
 
-  // Build environment for the session
-  const sessionEnv = buildSessionEnv(mounts);
-  if (group.containerConfig?.provider) {
-    const providerChanged =
-      group.containerConfig.provider !== sessionEnv.AGENT_RUNNER_BACKEND;
-    sessionEnv.AGENT_RUNNER_BACKEND = group.containerConfig.provider;
-    sessionEnv.AGENT_CLI_BIN =
-      group.containerConfig.cliBin ||
-      (providerChanged
-        ? group.containerConfig.provider
-        : sessionEnv.AGENT_CLI_BIN);
-  }
-  if (group.containerConfig?.model) {
-    sessionEnv.AGENT_MODEL = group.containerConfig.model;
-  }
-  if (group.containerConfig?.fallbackProvider === null) {
-    delete sessionEnv.AGENT_FALLBACK_BACKEND;
-    delete sessionEnv.AGENT_FALLBACK_CLI_BIN;
-    delete sessionEnv.AGENT_FALLBACK_MODEL;
-  } else if (group.containerConfig?.fallbackProvider) {
-    const providerChanged =
-      group.containerConfig.fallbackProvider !==
-      sessionEnv.AGENT_FALLBACK_BACKEND;
-    sessionEnv.AGENT_FALLBACK_BACKEND = group.containerConfig.fallbackProvider;
-    sessionEnv.AGENT_FALLBACK_CLI_BIN =
-      group.containerConfig.fallbackCliBin ||
-      (providerChanged
-        ? group.containerConfig.fallbackProvider
-        : sessionEnv.AGENT_FALLBACK_CLI_BIN);
-  }
-  if (group.containerConfig?.fallbackModel) {
-    sessionEnv.AGENT_FALLBACK_MODEL = group.containerConfig.fallbackModel;
-  }
+  recordConversationModel(group.folder, modelSelection, 'starting');
+  const originalOnOutput = onOutput;
+  if (onOutput)
+    onOutput = async (output) => {
+      recordConversationModel(
+        group.folder,
+        modelSelection,
+        output.status,
+        output.execution,
+      );
+      await originalOnOutput!(output);
+    };
 
   // Build the tmux command
   const envString = Object.entries(sessionEnv)
@@ -303,9 +284,20 @@ export async function runContainerAgent(
 
   const nodeCmd = `env ${envString} node ${shellEscape(agentRunnerPath)} < ${shellEscape(inputFile)} > ${shellEscape(outputFile)} 2>${shellEscape(stderrFile)}`;
 
-  log.debug({ sessionName, cmd: nodeCmd }, 'Tmux session command');
+  log.debug({ sessionName }, 'Tmux session command prepared');
 
-  return new Promise((resolve) => {
+  return new Promise((finish) => {
+    const resolve = (output: ContainerOutput) => {
+      // Streaming frames already carry the evidence; do not overwrite them with the final empty summary.
+      if (!originalOnOutput || output.status === 'error')
+        recordConversationModel(
+          group.folder,
+          modelSelection,
+          output.status,
+          output.execution,
+        );
+      finish(output);
+    };
     // Spawn tmux session
     try {
       execSync(

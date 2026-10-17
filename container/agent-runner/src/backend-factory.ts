@@ -27,6 +27,11 @@ export class ProviderBackend implements RunnerBackend {
     });
     return {
       ...result,
+      execution: {
+        provider: this.provider,
+        model: options.model || '',
+        fallback: false,
+      },
       newSessionId: result.newSessionId
         ? `${this.provider}:${result.newSessionId}`
         : undefined,
@@ -54,11 +59,18 @@ export class FallbackBackend implements RunnerBackend {
     } catch (err) {
       if (!this.fallback) throw err;
     }
-    return this.fallback.invoke(prompt, {
+    const result = await this.fallback.invoke(prompt, {
       ...options,
       sessionId: undefined,
+      env: { ...options.env, AGENT_THINKING_LEVEL: '' },
       model: process.env.AGENT_FALLBACK_MODEL || undefined,
     });
+    return {
+      ...result,
+      execution: result.execution
+        ? { ...result.execution, fallback: true }
+        : undefined,
+    };
   }
 }
 

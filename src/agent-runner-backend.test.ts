@@ -38,6 +38,11 @@ describe('provider-neutral agent runner', () => {
       expect.objectContaining({ sessionId: undefined }),
     );
     expect(result.newSessionId).toBe('opencode:next-session');
+    expect(result.execution).toEqual({
+      provider: 'opencode',
+      model: 'primary-model',
+      fallback: false,
+    });
   });
 
   it('strips the provider prefix when resuming its own session', async () => {
@@ -66,6 +71,11 @@ describe('provider-neutral agent runner', () => {
     const fallbackInvoke = vi.fn().mockResolvedValue({
       output: 'recovered',
       newSessionId: 'codex:recovery',
+      execution: {
+        provider: 'codex',
+        model: 'fallback-model',
+        fallback: false,
+      },
       exitCode: 0,
     });
     const fallback = fakeBackend(fallbackInvoke);
@@ -85,6 +95,11 @@ describe('provider-neutral agent runner', () => {
         }),
       );
       expect(result.output).toBe('recovered');
+      expect(result.execution).toEqual({
+        provider: 'codex',
+        model: 'fallback-model',
+        fallback: true,
+      });
     } finally {
       if (previousModel === undefined) delete process.env.AGENT_FALLBACK_MODEL;
       else process.env.AGENT_FALLBACK_MODEL = previousModel;
