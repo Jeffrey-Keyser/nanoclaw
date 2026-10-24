@@ -1,12 +1,14 @@
 ---
 name: logos
-description: Surface new Logos proposals and the daily proposals digest to the user via Telegram, and route approve/reject/comment replies back to the Logos API. Use when a `logos.proposal.created` or `logos.digest.ready` event arrives on RabbitMQ exchange `logos.events`, or when an incoming Telegram message matches the `approve <id>` / `reject <id> <reason>` / `comment <id> <text>` reply grammar.
+description: Forward the daily Logos proposals digest to Telegram, and route typed approve/reject/comment replies on Logos proposals back to the Logos API. Use when a `logos.digest.ready` event arrives on RabbitMQ exchange `logos.events`, or when an incoming Telegram message matches the `approve <id>` / `reject <id> <reason>` / `comment <id> <text>` reply grammar. New-proposal notifications are Agency HQ approve/reject cards, not this skill.
 allowed-tools: Bash(curl:*), Bash(rabbitmqadmin:*), Bash(jq:*)
 ---
 
-# Logos Proposal Push + Reply + Daily Digest
+# Logos Proposal Replies + Daily Digest
 
-Logos publishes proposal lifecycle events on the `logos.events` topic exchange (RabbitMQ). This skill turns two of those events — `logos.proposal.created` and `logos.digest.ready` — into Telegram nudges, and routes the user's reply on a proposal back to the Logos HTTP API.
+Logos publishes proposal lifecycle events on the `logos.events` topic exchange (RabbitMQ). This skill forwards `logos.digest.ready` to Telegram and routes the user's typed reply on a proposal back to the Logos HTTP API.
+
+> **New proposals arrive as Agency HQ cards.** Agency HQ consumes `logos.proposal.created` (queue `agency-hq.logos-proposal-cards`) and sends one Telegram card per proposal with ✅ Approve and preset ❌ reject buttons. Those taps go straight from Agency HQ to Logos. **Do not send your own nudge for `logos.proposal.created`** — it would duplicate the card. Typed `comment <short-id> …` replies (requested by the card) and typed approve/reject replies still come through you.
 
 ## Endpoints + constants
 
@@ -36,18 +38,9 @@ Endpoints:
 
 Source of truth: `LogosProposalCreatedEvent` in `@jeffrey-keyser/message-contracts/dist/logos/events.d.ts`. Field names are snake_case to match the wire format. The daily digest event (`logos.digest.ready`) has its own section below; everything else on this exchange (`logos.ingest.completed`, `logos.proposal.applied`, etc.) is out of scope.
 
-## What to do when an event arrives
+## When `logos.proposal.created` arrives
 
-1. **Compute short-id** = first 8 hex chars of `proposal_id` (e.g. `1a2b3c4d`). Drop dashes if you slice from the raw UUID; just take the first 8 of the lowercased hex.
-2. **Render `<page-or-new>`** = `page_slug` if `kind === "update_page"`, otherwise the literal string `new` for `kind === "create_page"`.
-3. **Persist mapping** — append `{ short_id, proposal_id, kind, page_slug, created_at }` to `/workspace/agent/logos-proposals.json` so a Telegram reply can resolve the short-id back to the full UUID after a container restart. See "Short-id mapping" below.
-4. **Send Telegram** — one message via your `send_message` destination (do not loop or retry):
-
-   ```
-   New Logos proposal: <kind> on <page-or-new>. Reply `approve <short-id>` / `reject <short-id> reason` / `comment <short-id> your-comment`.
-   ```
-
-   Example: `New Logos proposal: update_page on example-domain. Reply ` + backtick + `approve 1a2b3c4d` + backtick + `…`
+Do nothing. Agency HQ owns the notification (see above). The payload is documented above only so replies can be understood.
 
 ## Reply parsing
 
@@ -61,23 +54,19 @@ Match incoming Telegram text against the following grammar. Commands are **case-
 
 If the input doesn't match any of these, **don't act** — leave it for the normal conversational path. False positives here would call Logos with garbage.
 
-## Short-id mapping
+## Short-id resolution
 
-Persist mappings as line-delimited JSON at `/workspace/agent/logos-proposals.json` (workspace is mounted, survives container restarts):
-
-```bash
-mkdir -p /workspace/agent
-echo '{"short_id":"1a2b3c4d","proposal_id":"1a2b3c4d-e5f6-7890-abcd-ef0123456789","kind":"update_page","page_slug":"example-domain","created_at":"2026-05-01T18:00:00Z"}' >> /workspace/agent/logos-proposals.json
-```
-
-To resolve a short-id back to the full UUID:
+Replies carry the 8-hex short-id (first 8 chars of the proposal UUID, as printed on the Agency HQ card). Resolve it against Logos itself — only pending/commented proposals can be acted on:
 
 ```bash
 short_id="1a2b3c4d"
-proposal_id=$(grep -F "\"short_id\":\"${short_id}\"" /workspace/agent/logos-proposals.json | tail -n 1 | jq -r .proposal_id)
+proposal_id=$(for s in pending commented; do
+  curl -s "https://logos.jeffreykeyser.net/v1/proposals?status=${s}&limit=200" \
+    -H "Authorization: Bearer ${LOGOS_SERVICE_TOKEN}" | jq -r '.proposals[].id'
+done | grep "^${short_id}" | head -n 1)
 ```
 
-Two short-ids could collide (8 hex = 1 in 4B). On collision, the most recent entry wins (use `tail -n 1`); if the user complains about wrong proposal, ask them to paste the full UUID.
+Empty result → reply `No pending Logos proposal <short-id>` (already decided, or wrong id). If the user pastes a full UUID, use it directly.
 
 ## Calling Logos
 
@@ -137,7 +126,7 @@ Digest body is precomputed by Logos — pending proposals listed as short-id (fi
 
 When the routing key is `logos.digest.ready`, forward `message` to Telegram **verbatim** via your `send_message` destination — no reformatting, no enrichment, no truncation, and no reply prompt appended. Logos owns the wording. One message per event; no retries; no reply path back to Logos for this event (the digest is notify-only — replies, if any, fall through to the normal conversational path).
 
-Same `rabbitmqadmin` pattern as `logos.proposal.created` (see "Subscribing to the exchange" below) — just swap the routing key + payload:
+Smoke it with the `rabbitmqadmin` pattern from "Subscribing to the exchange" below:
 
 ```bash
 rabbitmqadmin publish \
@@ -168,8 +157,8 @@ The shared consumer queue `logos.events.consumer` belongs to Logos itself — do
 
 ## Out of scope
 
-- Inline keyboard buttons. Plain reply commands only.
+- Inline keyboard buttons and new-proposal nudges — Agency HQ owns those cards (`src/services/logos-proposal-cards.ts`).
 - Threading state across multiple proposals (no "active proposal" — every reply must include the short-id).
 - Durable consumer queue owned by NanoClaw. The host-side router or a temp queue is enough for v1.
 - Backfill of historical proposals.
-- Other routing keys on `logos.events` (`ingest.completed`, `proposal.applied`, etc.) — only `logos.proposal.created` and `logos.digest.ready` are handled here.
+- Other routing keys on `logos.events` (`proposal.created`, `ingest.completed`, `proposal.applied`, etc.) — only `logos.digest.ready` is handled here.
