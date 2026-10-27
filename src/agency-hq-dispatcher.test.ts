@@ -8,13 +8,15 @@ vi.mock('./task-scheduler.js', async (importOriginal) => {
   };
 });
 
-import { _initTestDatabase } from './db/index.js';
+import { _initTestDatabase, getTaskById } from './db/index.js';
+import { ensureWatchdogTask, WATCHDOG_TASK_ID } from './ops-agent-watchdog.js';
 import {
   _testInternals,
   reconcileOrphanedDispatches,
   startDispatchLoop,
   isLegacyAgencyDispatchEnabled,
   startStallDetector,
+  startOpsWatchdog,
   stopAgencyHqSubsystems,
 } from './agency-hq-dispatcher.js';
 import { runScheduledTask } from './task-scheduler.js';
@@ -924,6 +926,37 @@ describe('agency-hq-dispatcher', () => {
   });
 
   describe('lifecycle', () => {
+    afterEach(() => vi.unstubAllEnvs());
+
+    it('disables the legacy watchdog for external dispatch and pauses its old task', async () => {
+      vi.stubEnv('NANOCLAW_LEGACY_AGENCY_DISPATCH', 'false');
+      vi.stubEnv('OPS_WATCHDOG_ENABLED', 'true');
+      ensureWatchdogTask();
+      expect(startOpsWatchdog(makeMockDeps())).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(getTaskById(WATCHDOG_TASK_ID)).toMatchObject({
+        status: 'paused',
+        next_run: null,
+      });
+      await vi.advanceTimersByTimeAsync(30 * 60_000);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('runs the watchdog only for explicitly enabled legacy dispatch', () => {
+      vi.stubEnv('NANOCLAW_LEGACY_AGENCY_DISPATCH', 'true');
+      vi.stubEnv('OPS_WATCHDOG_ENABLED', 'true');
+      expect(startOpsWatchdog(makeMockDeps())).toBe(true);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(getTaskById(WATCHDOG_TASK_ID)?.status).toBe('paused');
+    });
+
+    it('honors the watchdog kill switch even with legacy dispatch enabled', () => {
+      vi.stubEnv('NANOCLAW_LEGACY_AGENCY_DISPATCH', 'true');
+      vi.stubEnv('OPS_WATCHDOG_ENABLED', 'false');
+      expect(startOpsWatchdog(makeMockDeps())).toBe(false);
+      expect(vi.getTimerCount()).toBe(0);
+    });
+
     it('defaults dispatch ownership to Agency HQ', () => {
       delete process.env.NANOCLAW_LEGACY_AGENCY_DISPATCH;
       expect(isLegacyAgencyDispatchEnabled()).toBe(false);

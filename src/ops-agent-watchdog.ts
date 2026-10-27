@@ -6,15 +6,20 @@
  * systemctl so that stale slot recovery (recoverStaleSlots) can clean up on
  * the next boot.
  *
- * Registered as an interval scheduled task (15 min) in SQLite via
- * ensureWatchdogTask() so it appears in NanoClaw's standard cron/task flow.
+ * Enabled only for the opt-in legacy NanoClaw dispatcher. A paused SQLite
+ * bookkeeping row records ticks; the general task scheduler must not run it.
  * Default interval: 15 minutes.
  */
 
 import { execSync } from 'child_process';
 
 import { agencyFetch } from './agency-hq-client.js';
-import { createTask, getTaskById, updateTaskAfterRun } from './db/index.js';
+import {
+  createTask,
+  getTaskById,
+  updateTask,
+  updateTaskAfterRun,
+} from './db/index.js';
 import { getDispatchSlotBackend } from './dispatch-slot-backends.js';
 import { createCorrelationLogger, logger } from './logger.js';
 import { getAgentRuntime } from './runtime-adapter.js';
@@ -79,12 +84,15 @@ async function withRetry<T>(
 // --- Scheduled task registration ---
 
 /**
- * Ensure the watchdog is registered as an interval scheduled task in SQLite.
- * Idempotent — skips if the row already exists (INSERT OR IGNORE).
+ * Keep a paused bookkeeping row in SQLite. Only the watchdog's own interval
+ * runs ticks; a formerly active row is paused to avoid duplicate scheduling.
  */
 export function ensureWatchdogTask(): void {
   const existing = getTaskById(WATCHDOG_TASK_ID);
-  if (existing) return;
+  if (existing) {
+    pauseWatchdogTask();
+    return;
+  }
 
   const now = new Date().toISOString();
   const nextRun = new Date(
@@ -100,7 +108,9 @@ export function ensureWatchdogTask(): void {
     schedule_value: String(OPS_AGENT_WATCHDOG_INTERVAL),
     context_mode: 'isolated',
     next_run: nextRun,
-    status: 'active',
+    // The watchdog owns its interval; the general scheduler must not also
+    // dispatch this internal bookkeeping row as an agent task.
+    status: 'paused',
     created_at: now,
   });
 
@@ -108,6 +118,12 @@ export function ensureWatchdogTask(): void {
     { taskId: WATCHDOG_TASK_ID, nextRun },
     'Registered ops-watchdog scheduled task',
   );
+}
+
+export function pauseWatchdogTask(): void {
+  if (getTaskById(WATCHDOG_TASK_ID)) {
+    updateTask(WATCHDOG_TASK_ID, { status: 'paused', next_run: null });
+  }
 }
 
 // --- Core detection ---

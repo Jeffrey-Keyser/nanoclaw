@@ -15,7 +15,7 @@ Environment=CREDENTIAL_PROXY_PORT=3100
 Environment=SKILL_SERVER_PORT=3101
 Environment=MESSAGE_API_PORT=3102
 Environment=DISPATCH_SLOTS_PG=true
-Environment=OPS_WATCHDOG_ENABLED=true
+Environment=OPS_WATCHDOG_ENABLED=false
 StandardOutput=append:/home/jkeyser/nanoclaw/logs/nanoclaw.log
 StandardError=append:/home/jkeyser/nanoclaw/logs/nanoclaw.error.log
 OOMScoreAdjust=-500

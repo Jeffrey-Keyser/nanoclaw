@@ -488,10 +488,12 @@ export async function initApp(): Promise<void> {
     });
     logger.error({ err }, 'Failed to start stall detector');
   }
-  startOpsWatchdog(schedulerDeps, notificationBatcher);
+  const watchdogStarted = startOpsWatchdog(schedulerDeps, notificationBatcher);
   setSubsystemState('ops-watchdog', {
-    state: 'running',
-    details: 'Dispatch slot watchdog active (every 15 min).',
+    state: watchdogStarted ? 'running' : 'disabled',
+    details: watchdogStarted
+      ? 'Compatibility dispatch slot watchdog active (every 15 min).'
+      : 'Legacy watchdog disabled; Agency HQ/dev-inbox owns dispatch recovery.',
   });
   startUptimeMonitor({
     registeredGroups: () => state.registeredGroups,

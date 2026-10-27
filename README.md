@@ -170,6 +170,18 @@ polling dispatcher is disabled by default. Set
 `NANOCLAW_LEGACY_AGENCY_DISPATCH=true` only on older installations that still
 expose the retired slot-write HTTP contract.
 
+The legacy ops watchdog follows the same opt-in and can additionally be disabled
+with `OPS_WATCHDOG_ENABLED=false`. It stays off for external dispatch, whose
+workers run on Forge; restarting NanoClaw cannot recover those workers. The old
+watchdog task row is paused because watchdog ticks use their own interval.
+
+The Beelink user-service monitor polls every five minutes. It alerts once a
+service remains failed across two checks, with the host, impact, and diagnostic
+and restart commands. Incident state persists in SQLite across NanoClaw restarts.
+Recoveries, including brief failures that resolved before an alert, are collected
+into one summary every 24 hours while the monitor runs. Empty summaries are not
+sent. Failed status checks do not count as service recoveries.
+
 `smoke:db-container` is the operational smoke test for the v2 DB-backed agent path. It:
 
 - injects a CLI-routed message into a live agent session without sending Telegram output

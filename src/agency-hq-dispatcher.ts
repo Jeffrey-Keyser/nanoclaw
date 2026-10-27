@@ -27,6 +27,7 @@ import { detectStalledTasks, dispatchTime } from './stall-detector.js';
 import {
   startOpsAgentWatchdog,
   stopOpsAgentWatchdog,
+  pauseWatchdogTask,
 } from './ops-agent-watchdog.js';
 import { createCorrelationLogger, logger } from './logger.js';
 import type { NotificationBatcher } from './notification-batcher.js';
@@ -333,8 +334,20 @@ export async function startStallDetector(
 export function startOpsWatchdog(
   deps: SchedulerDependencies,
   notificationBatcher?: NotificationBatcher,
-): void {
+): boolean {
+  stopOpsAgentWatchdog();
+  pauseWatchdogTask();
+  if (
+    !isLegacyAgencyDispatchEnabled() ||
+    process.env.OPS_WATCHDOG_ENABLED === 'false'
+  ) {
+    logger.info(
+      'Legacy ops watchdog disabled; external dispatch owns recovery',
+    );
+    return false;
+  }
   startOpsAgentWatchdog(deps, isStopping, notificationBatcher);
+  return true;
 }
 
 export async function stopAgencyHqSubsystems(): Promise<void> {

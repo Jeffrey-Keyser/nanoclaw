@@ -25,12 +25,13 @@ vi.mock('./db/index.js', () => ({
   createTask: vi.fn(),
   getTaskById: vi.fn(() => undefined),
   updateTaskAfterRun: vi.fn(),
+  updateTask: vi.fn(),
 }));
 
 import { execSync } from 'child_process';
 import { getAgentRuntime } from './runtime-adapter.js';
 import { getDispatchSlotBackend } from './dispatch-slot-backends.js';
-import { createTask, getTaskById } from './db/index.js';
+import { createTask, getTaskById, updateTask } from './db/index.js';
 import {
   detectStuckSlots,
   ensureWatchdogTask,
@@ -149,7 +150,7 @@ describe('ops-agent-watchdog', () => {
           id: WATCHDOG_TASK_ID,
           schedule_type: 'interval',
           schedule_value: '900000',
-          status: 'active',
+          status: 'paused',
         }),
       );
     });
@@ -161,6 +162,10 @@ describe('ops-agent-watchdog', () => {
       } as never);
       ensureWatchdogTask();
       expect(createTask).not.toHaveBeenCalled();
+      expect(updateTask).toHaveBeenCalledWith(WATCHDOG_TASK_ID, {
+        status: 'paused',
+        next_run: null,
+      });
     });
   });
 
