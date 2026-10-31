@@ -8,8 +8,8 @@ echo "Deploying NanoClaw..."
 git pull origin main
 
 # Install dependencies needed to build both the core and the agent-runner
-npm ci
-npm --prefix container/agent-runner ci
+npm ci --include=dev
+npm --prefix container/agent-runner ci --include=dev
 
 # Build NanoClaw core and host-side agent-runner bundle
 npm run build:core
