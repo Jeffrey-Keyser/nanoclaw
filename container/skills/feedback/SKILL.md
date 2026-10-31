@@ -1,12 +1,12 @@
 ---
 name: feedback
-description: File bug reports or feature requests to the Feedback Registry via IPC. Use when you encounter bugs or have improvement ideas to report.
+description: File bug reports, feature requests or questions to the Feedback Registry via IPC. Use when you encounter bugs or have improvement ideas to report.
 allowed-tools: Bash(feedback:*)
 ---
 
 # Submit Feedback via IPC
 
-File bug reports or feature requests to the Feedback Registry at api.feedback.jeffreykeyser.net.
+File bug reports, feature requests or questions to the Feedback Registry at feedback.jeffreykeyser.net (registered as app `nanoclaw`). The host can point at a different registry with `FEEDBACK_REGISTRY_URL` in nanoclaw's `.env`.
 
 ## Setup
 
@@ -25,8 +25,8 @@ feedback --type feature --title "Short summary" --description "What the feature 
 
 ## Parameters
 
-- **--type** (required): Either `bug` or `feature`.
-- **--title** (required): A short summary of the bug or feature request.
+- **--type** (required): `bug`, `feature` or `question`.
+- **--title** (required): A short summary (truncated to 255 characters).
 - **--description** (required): A detailed description with context.
 - **--email** (optional): Contact email for follow-up.
 
@@ -53,6 +53,6 @@ feedback --type feature --title "Date range search" --description "Users need to
 ## Notes
 
 - Feedback is submitted to the Feedback Registry via the host IPC mechanism
-- The `source` field is automatically set to `nanoclaw`
+- The host submits with `appId: nanoclaw` and records `metadata.source = nanoclaw` plus the originating group
 - Failed submissions are logged but do not crash your session
 - Keep titles concise and descriptions actionable

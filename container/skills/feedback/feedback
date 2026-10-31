@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # feedback — File a bug report or feature request via IPC to the Feedback Registry
-# Usage: feedback --type <bug|feature> --title "<title>" --description "<description>" [--email "<email>"]
+# Usage: feedback --type <bug|feature|question> --title "<title>" --description "<description>" [--email "<email>"]
 set -euo pipefail
 
 IPC_DIR="${IPC_DIR:-/home/user/.ipc}"
@@ -15,7 +15,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --type)
       type="${2:-}"
-      [[ -z "$type" ]] && { echo "Error: --type requires a value (bug or feature)" >&2; exit 1; }
+      [[ -z "$type" ]] && { echo "Error: --type requires a value (bug, feature or question)" >&2; exit 1; }
       shift 2
       ;;
     --type=*)
@@ -62,11 +62,11 @@ done
 
 # Validate required fields
 if [[ -z "$type" ]]; then
-  echo "Error: --type is required (bug or feature)" >&2
+  echo "Error: --type is required (bug, feature or question)" >&2
   exit 1
 fi
-if [[ "$type" != "bug" && "$type" != "feature" ]]; then
-  echo "Error: --type must be 'bug' or 'feature', got '$type'" >&2
+if [[ "$type" != "bug" && "$type" != "feature" && "$type" != "question" ]]; then
+  echo "Error: --type must be 'bug', 'feature' or 'question', got '$type'" >&2
   exit 1
 fi
 if [[ -z "$title" ]]; then
