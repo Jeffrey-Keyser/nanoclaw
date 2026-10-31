@@ -2,6 +2,11 @@
 # NanoClaw deploy script — graceful restart that waits for active agent sessions
 set -e
 
+# beelink-deploy runs as a system service without the user D-Bus session, so
+# `systemctl --user` fails with "Failed to connect to bus" unless these are set.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+
 echo "Deploying NanoClaw..."
 
 # Pull latest
