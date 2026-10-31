@@ -50,7 +50,11 @@ fi
 # Restart (user service, no sudo needed)
 systemctl --user restart nanoclaw
 
-# Smoke-check the main service health endpoint after restart
+# Smoke-check the main service health endpoint after restart. The port lives
+# in the systemd unit (SKILL_SERVER_PORT=3101), not in this shell, and the
+# script's 3002 default is the Prompt Registry.
+SKILL_SERVER_PORT="${SKILL_SERVER_PORT:-$(systemctl --user show nanoclaw -p Environment --value | tr ' ' '\n' | sed -n 's/^SKILL_SERVER_PORT=//p')}"
+export SKILL_SERVER_PORT
 npm run smoke:health
 
 echo "Deploy complete."
