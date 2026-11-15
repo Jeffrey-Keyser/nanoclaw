@@ -68,3 +68,36 @@ Diagnostics use fixed codes (`timeout`, `transport_error`, `auth_rejected`,
 `conflict`, `invalid_payload`, `malformed_envelope`, `missing_capture_id`,
 `missing_entry_id`, `server_error`, `unexpected_status`) without logging
 text, credentials, source keys, or response bodies.
+
+## Prompt replies
+
+An ordinary owner text reply to a delivered Life prompt is saved against
+that prompt. Binding requires an explicit `reply_to_message` whose target
+matches a retained delivery receipt in the current scope (normalized
+endpoint, journal, credential fingerprint, verified private `ceo`
+destination). Only the owner sender in that private destination binds;
+all other senders, chats, and destinations keep ordinary handling.
+
+When matched, NanoClaw forwards once with the existing text receiver and
+includes both identities: `promptInstanceId` from the receipt and
+`sourceMessageKey: telegram:<chatId>:<incomingMessageId>` from the reply.
+The delivered prompt message supplies only the lookup key. Redelivery
+reuses the same two identities. Life remains authoritative for prompt
+validity, account and journal scope, replay conflicts, and transactional
+association.
+
+Historical messages without retained receipts stay ordinary messages.
+Ambiguous matches and lookup failures stop capture with contained guidance
+and never guess a prompt. Matched receiver failures never fall back to an
+unassociated capture. Slash commands bypass prompt-reply routing.
+
+Outcome guidance preserves saved, rejected, and unconfirmed outcomes:
+
+- `Saved to Life.` — saved or confirmed replay.
+- `Life capture rejected.` — invalid payload, conflict, or auth rejection.
+- `Life capture unconfirmed.` — timeout, transport, server, or malformed
+  receipt.
+- `Life prompt reply ambiguous.` — multiple distinct prompts share the
+  target; no capture is attempted.
+- `Life prompt reply unavailable.` — receipt lookup failed; no capture is
+  attempted.

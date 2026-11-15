@@ -17,6 +17,7 @@ export interface ForwardVoiceCaptureInput {
   audio: Uint8Array | Buffer | ArrayBuffer | Blob;
   mimeType: string;
   sourceMessageKey: string;
+  promptInstanceId?: string;
   durationSeconds?: number;
 }
 
@@ -136,6 +137,7 @@ export async function forwardVoiceCapture(
 ): Promise<ForwardVoiceCaptureResult> {
   const { fetchImpl, config, audio, mimeType, sourceMessageKey } = input;
   const durationSeconds = input.durationSeconds;
+  const promptInstanceId = input.promptInstanceId;
   const base = trimTrailingSlash(config.baseUrl);
   const journalSegment = encodeURIComponent(config.journalId);
   const receiptUrl = `${base}/api/v1/journals/${journalSegment}/voice/captures`;
@@ -149,6 +151,9 @@ export async function forwardVoiceCapture(
       `voice${extensionForMime(mimeType)}`,
     );
     form.append('sourceMessageKey', sourceMessageKey);
+    if (typeof promptInstanceId === 'string' && promptInstanceId.length > 0) {
+      form.append('promptInstanceId', promptInstanceId);
+    }
     if (
       typeof durationSeconds === 'number' &&
       Number.isFinite(durationSeconds)

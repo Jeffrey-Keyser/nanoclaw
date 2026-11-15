@@ -132,7 +132,7 @@ interface TelegramNonTextContext {
 }
 
 interface VoiceForwardContext {
-  chat: { id: number | string };
+  chat: { id: number | string; type?: string };
   message: {
     message_id: number;
     voice?: {
@@ -141,10 +141,13 @@ interface VoiceForwardContext {
       duration?: number;
       mime_type?: string;
     };
+    reply_to_message?: { message_id?: unknown };
   };
+  from?: { id?: number | string };
   api: {
     getFile: (fileId: string) => Promise<{ file_path?: string; file_size?: number }>;
   };
+  reply?: (text: string) => Promise<unknown>;
 }
 
 function getTelegramChatTitle(chat: { title?: unknown }): string | undefined {
@@ -914,6 +917,20 @@ export class TelegramChannel implements Channel {
     this.bot!.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot!.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot!.on('message:voice', async (ctx) => {
+      try {
+        if (
+          await this.handleLifePromptVoiceReply(
+            ctx as unknown as VoiceForwardContext,
+          )
+        ) {
+          return;
+        }
+      } catch {
+        logger.error(
+          { code: 'life_prompt_reply_lookup_failed' },
+          'Life prompt voice reply lookup failed',
+        );
+      }
       storeNonText(ctx, '[Voice message]');
       try {
         await this.forwardVoiceToLife(ctx as unknown as VoiceForwardContext);
@@ -1255,6 +1272,233 @@ export class TelegramChannel implements Channel {
         'Life voice forward failed',
       );
     }
+  }
+
+  private async handleLifePromptVoiceReply(
+    ctx: VoiceForwardContext,
+  ): Promise<boolean> {
+    const replyToId = ctx.message?.reply_to_message?.message_id;
+    if (typeof replyToId !== 'number' || !Number.isInteger(replyToId)) {
+      return false;
+    }
+    if (!ctx.message?.voice) return false;
+    const chatId = String((ctx.chat as { id?: unknown })?.id ?? '');
+    if (!chatId) return false;
+    if ((ctx.chat as { type?: unknown })?.type !== 'private') return false;
+    const chatJid = `tg:${chatId}`;
+    let groups: Record<string, RegisteredGroup>;
+    try {
+      groups = this.opts.registeredGroups();
+    } catch {
+      return false;
+    }
+    const group = groups[chatJid];
+    if (!group || group.folder !== 'ceo') return false;
+    let ceoDestination: string | null;
+    try {
+      ceoDestination = resolveCeoDestination(groups);
+    } catch {
+      return false;
+    }
+    if (ceoDestination !== chatJid) return false;
+    const sender =
+      ctx.from?.id !== undefined ? String(ctx.from.id) : '';
+    if (!sender || sender !== chatId) return false;
+    const lifeConfig = resolveLifeVoiceConfig();
+    if (!lifeConfig) return false;
+    const scope = {
+      endpoint: normalizeEndpoint(lifeConfig.baseUrl),
+      journalId: lifeConfig.journalId,
+      credentialFingerprint: credentialFingerprint(lifeConfig.token),
+      destination: chatJid,
+    };
+    let resolution: ReturnType<typeof resolveLifePromptReply>;
+    try {
+      resolution = resolveLifePromptReply(scope, replyToId);
+    } catch {
+      logger.warn(
+        { code: 'life_prompt_reply_lookup_failed' },
+        'Life prompt reply lookup failed',
+      );
+      try {
+        await ctx.reply?.('Life prompt reply unavailable.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    if (resolution.status === 'unknown') return false;
+    if (resolution.status === 'ambiguous') {
+      logger.warn(
+        { code: 'life_prompt_reply_ambiguous' },
+        'Life prompt reply ambiguous',
+      );
+      try {
+        await ctx.reply?.('Life prompt reply ambiguous.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    const promptInstanceId = resolution.promptInstanceId;
+    const replyMessageId = String(ctx.message.message_id);
+    const sourceMessageKey = `telegram:${chatId}:${replyMessageId}`;
+    const voice = ctx.message.voice;
+    const fileId = voice?.file_id;
+    if (!fileId) {
+      logger.warn(
+        { code: 'life_prompt_voice_missing_file' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    if (
+      typeof voice?.file_size === 'number' &&
+      voice.file_size > TELEGRAM_VOICE_MAX_BYTES
+    ) {
+      logger.warn(
+        { code: 'life_prompt_voice_too_large' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    let file: { file_path?: string; file_size?: number };
+    try {
+      file = await ctx.api.getFile(fileId);
+    } catch {
+      logger.error(
+        { code: 'life_prompt_voice_getfile_failed' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    if (
+      typeof file.file_size === 'number' &&
+      file.file_size > TELEGRAM_VOICE_MAX_BYTES
+    ) {
+      logger.warn(
+        { code: 'life_prompt_voice_too_large' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    const filePath = file.file_path;
+    if (!filePath) {
+      logger.warn(
+        { code: 'life_prompt_voice_missing_path' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    let audioBytes: Buffer;
+    try {
+      const downloadRes = await fetch(
+        buildTelegramFileUrl(this.botToken, filePath),
+      );
+      if (!downloadRes.ok) {
+        logger.error(
+          { code: 'life_prompt_voice_download_failed' },
+          'Life prompt voice reply failed',
+        );
+        try {
+          await ctx.reply?.('Life voice capture failed.');
+        } catch {
+          // Reply failures stay contained.
+        }
+        return true;
+      }
+      const downloaded = await downloadRes.arrayBuffer();
+      audioBytes = Buffer.from(downloaded);
+    } catch {
+      logger.error(
+        { code: 'life_prompt_voice_download_failed' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    if (audioBytes.length > TELEGRAM_VOICE_MAX_BYTES) {
+      logger.warn(
+        { code: 'life_prompt_voice_too_large' },
+        'Life prompt voice reply failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    const mimeType = voice?.mime_type || 'audio/ogg';
+    const durationSeconds =
+      typeof voice?.duration === 'number' ? voice.duration : undefined;
+    let result: Awaited<ReturnType<typeof forwardVoiceCapture>>;
+    try {
+      result = await forwardVoiceCapture({
+        fetchImpl: fetch as unknown as (
+          input: string | URL,
+          init?: RequestInit,
+        ) => Promise<Response>,
+        config: lifeConfig,
+        audio: audioBytes,
+        mimeType,
+        sourceMessageKey,
+        promptInstanceId,
+        durationSeconds,
+      });
+    } catch {
+      logger.error(
+        { code: 'life_prompt_reply_forward_failed' },
+        'Life prompt voice reply forward failed',
+      );
+      try {
+        await ctx.reply?.('Life voice capture failed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    try {
+      if (result.outcome === 'completed') {
+        await ctx.reply?.('Saved to Life.');
+      } else if (result.outcome === 'review_in_life') {
+        await ctx.reply?.('Voice held for review in Life.');
+      } else {
+        await ctx.reply?.('Life voice capture failed.');
+      }
+    } catch {
+      // Reply failures stay contained.
+    }
+    return true;
   }
 
   private async handleLifePromptTextReply(ctx: {

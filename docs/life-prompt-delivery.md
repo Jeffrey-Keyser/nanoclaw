@@ -41,6 +41,46 @@ Restart resumes acknowledgment from confirmed receipts without repeating recorde
 
 A crash or uncertain network result after Telegram accepts a message but before receipt persistence can still cause a repeat send on retry. Receipt persistence happens immediately after each confirmed send to narrow this window, but the transport does not provide exactly-once delivery. Live delivery quality and owner assessment of prompt text remain operational evaluations outside automated verification.
 
+## Prompt replies (text and voice)
+
+An ordinary owner reply to a retained delivered prompt is routed before
+unrelated flows: text before pending-response and assistant handling,
+voice before generic storage and forwarding. Each matched reply receives
+exactly one routing decision. Admission requires the owner sender in the
+registered private `ceo` destination with current Life configuration,
+endpoint normalization, credential fingerprinting, and destination
+verification. Slash commands bypass reply routing.
+
+Reverse lookup uses the complete current delivery scope plus
+`reply_to_message.message_id`. Any confirmed multipart receipt part
+identifies its prompt, including before acknowledgment succeeds. Exactly
+one distinct prompt identity is required. Unknown messages remain ordinary
+messages; ambiguous matches and lookup failures stop capture with
+contained guidance and never supply a guessed prompt.
+
+Both forwarders accept an optional `promptInstanceId`: text includes it in
+the JSON receipt, voice includes it in the initial multipart receipt. The
+original audio bytes and the existing receipt, processing, review, and
+completion protocol are preserved. The incoming reply's Telegram identity
+supplies `sourceMessageKey`; the delivered prompt message supplies only
+the association lookup. Redelivery reuses these identities.
+
+Life remains authoritative for prompt validity, account and journal scope,
+replay conflicts, and transactional association. Receiver failures and
+uncertain results never trigger an unassociated fallback. Historical
+messages without retained receipts keep ordinary handling.
+
+Text guidance preserves saved, rejected, and unconfirmed outcomes. Voice
+guidance distinguishes completed, review-in-Life, and failed outcomes
+without claiming unfinished processing succeeded:
+
+- `Saved to Life.` — voice completed.
+- `Voice held for review in Life.` — voice unresolved or awaiting review.
+- `Life voice capture failed.` — voice receipt, processing, completion,
+  download, or transport failure.
+- `Life prompt reply ambiguous.` / `Life prompt reply unavailable.` —
+  contained lookup stops without capture.
+
 ## Logging
 
-Logs omit bearer tokens, prompt text, and unsafe raw transport errors. Entries carry stable codes such as `prompt_delivery_send_failed` and `prompt_delivery_acknowledged`.
+Logs omit bearer tokens, prompt text, and unsafe raw transport errors. Entries carry stable codes such as `prompt_delivery_send_failed` and `prompt_delivery_acknowledged`. Prompt-reply diagnostics use fixed codes (`life_prompt_reply_lookup_failed`, `life_prompt_reply_ambiguous`, `life_prompt_reply_forward_failed`, `life_prompt_voice_download_failed`, `life_prompt_voice_too_large`, and related codes) without message bodies, audio, or credentials.

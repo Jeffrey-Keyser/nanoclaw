@@ -583,6 +583,94 @@ describe('forwardVoiceCapture', () => {
     expectNoSecrets();
   });
 
+  it('includes promptInstanceId on the initial receipt while preserving original audio', async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      promptInstanceId: 'prompt-voice-1',
+    });
+
+    expect(result).toEqual({ outcome: 'completed', captureId: CAP_NEW });
+    expect(calls).toHaveLength(3);
+    const receiptBody = calls[0].init?.body;
+    expect(receiptBody).toBeInstanceOf(FormData);
+    const form = receiptBody as FormData;
+    expect(form.get('promptInstanceId')).toBe('prompt-voice-1');
+    expect(form.get('sourceMessageKey')).toBe(SOURCE_KEY);
+    const audioPart = form.get('audio') as Blob;
+    expect(audioPart).toBeInstanceOf(Blob);
+    expect(await audioPart.text()).toBe(AUDIO_TEXT);
+    expectNoSecrets();
+  });
+
+  it('omits promptInstanceId from the receipt when not supplied', async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+    });
+
+    const receiptBody = calls[0].init?.body;
+    expect(receiptBody).toBeInstanceOf(FormData);
+    expect((receiptBody as FormData).get('promptInstanceId')).toBeNull();
+    expectNoSecrets();
+  });
+
   it('never calls resolve', async () => {
     const { fetchImpl, calls } = recordingFetch((url) => {
       if (url === receiptUrl()) {

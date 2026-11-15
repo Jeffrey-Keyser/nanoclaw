@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-import { _initTestDatabase } from '../db/index.js';
+import { _initTestDatabase, _setLifePromptDeliveriesDb } from '../db/index.js';
 import {
   insertLifePromptDeliveryReceipt,
   markLifePromptDeliveryAcknowledged,
@@ -497,6 +497,450 @@ describe('life prompt text reply forwarding (production path)', () => {
     expect(serverCtx.reply).toHaveBeenCalledWith(expect.stringContaining('unconfirmed'));
     expect(opts.onMessage).not.toHaveBeenCalled();
     serverSpy.mockRestore();
+    await ch.disconnect();
+  });
+});
+
+describe('life prompt voice reply forwarding (production path)', () => {
+  const VOICE_AUDIO = 'VOICE-BYTES-xyz-123-prompt-reply';
+  const CAP_VOICE = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+
+  function getVoiceHandler(bot: any) {
+    const call = bot.on.mock.calls.find((c: any) => c[0] === 'message:voice');
+    return call?.[1];
+  }
+
+  function makeVoiceReplyCtx(overrides: any = {}) {
+    return {
+      message: {
+        message_id: 920,
+        date: Date.now() / 1000,
+        voice: {
+          file_id: 'file-voice-1',
+          file_size: 1000,
+          duration: 7,
+          mime_type: 'audio/ogg',
+        },
+        reply_to_message: { message_id: 701 },
+      },
+      chat: { id: 111, type: 'private' },
+      from: { id: 111, first_name: 'Ceo' },
+      api: {
+        getFile: vi.fn().mockResolvedValue({ file_path: 'voice/prompt_701.ogg' }),
+      },
+      reply: vi.fn().mockResolvedValue(undefined),
+      me: { username: 'test_bot' },
+      ...overrides,
+    };
+  }
+
+  function voiceReceiptUrl(): string {
+    return 'https://life.example.com/api/v1/journals/journal-1/voice/captures';
+  }
+
+  function mockVoiceTransport(
+    lifeHandler: (url: string, init?: RequestInit) => Response | Promise<Response>,
+  ) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const url = String(input);
+      if (url.includes('api.telegram.org')) {
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () =>
+            new TextEncoder().encode(VOICE_AUDIO).buffer as ArrayBuffer,
+        } as Response;
+      }
+      return lifeHandler(url, init);
+    });
+  }
+
+  function lifeCompleted(captureId: string) {
+    return (url: string) => {
+      if (url === voiceReceiptUrl()) {
+        return jsonRes(
+          { success: true, data: { captureId, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonRes(
+          {
+            success: true,
+            data: { captureId, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonRes(
+          { success: true, data: { captureId, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected life url ${url}`);
+    };
+  }
+
+  function lifeCallsForReceipt(spy: ReturnType<typeof vi.spyOn>): Array<{ url: string; init?: RequestInit }> {
+    return spy.mock.calls
+      .map((c) => ({ url: String(c[0]), init: c[1] as RequestInit | undefined }))
+      .filter((c) => c.url.includes('/voice/captures'));
+  }
+
+  beforeEach(() => {
+    _initTestDatabase();
+    clearLifeEnv();
+    setLifeEnv();
+    lastBotInstance = null;
+    promptConsumerRecords.length = 0;
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    clearLifeEnv();
+  });
+
+  it('forwards a matched voice reply with unchanged audio and promptInstanceId on the initial receipt', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-1',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 701,
+      sourceMessageKey: 'telegram:111:701',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted(CAP_VOICE));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx();
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    expect(ctx.api.getFile).toHaveBeenCalledWith('file-voice-1');
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls).toHaveLength(3);
+    const receiptBody = lifeCalls[0].init?.body;
+    expect(receiptBody).toBeInstanceOf(FormData);
+    const form = receiptBody as FormData;
+    expect(form.get('sourceMessageKey')).toBe('telegram:111:920');
+    expect(form.get('promptInstanceId')).toBe('prompt-voice-1');
+    const audioPart = form.get('audio') as Blob;
+    expect(audioPart).toBeInstanceOf(Blob);
+    expect(await audioPart.text()).toBe(VOICE_AUDIO);
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('resolves a multipart prompt part and reuses persisted receipts with stable redelivery', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-multi',
+      partIndex: 0,
+      partCount: 2,
+      telegramMessageId: 711,
+      sourceMessageKey: 'telegram:111:711',
+    });
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-multi',
+      partIndex: 1,
+      partCount: 2,
+      telegramMessageId: 712,
+      sourceMessageKey: 'telegram:111:711.712',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted(CAP_VOICE));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const handler = getVoiceHandler(lastBotInstance);
+    const ctx1 = makeVoiceReplyCtx({
+      message: {
+        message_id: 921,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, duration: 3, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 712 },
+      },
+    });
+    const ctx2 = makeVoiceReplyCtx({
+      message: {
+        message_id: 921,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, duration: 3, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 712 },
+      },
+    });
+    await handler(ctx1);
+    markLifePromptDeliveryAcknowledged(scope, 'prompt-voice-multi');
+    await handler(ctx2);
+
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls).toHaveLength(6);
+    const firstReceipt = lifeCalls[0].init?.body as FormData;
+    const secondReceipt = lifeCalls[3].init?.body as FormData;
+    expect(firstReceipt.get('promptInstanceId')).toBe('prompt-voice-multi');
+    expect(secondReceipt.get('promptInstanceId')).toBe('prompt-voice-multi');
+    expect(firstReceipt.get('sourceMessageKey')).toBe('telegram:111:921');
+    expect(secondReceipt.get('sourceMessageKey')).toBe('telegram:111:921');
+    expect(await (firstReceipt.get('audio') as Blob).text()).toBe(VOICE_AUDIO);
+    expect(await (secondReceipt.get('audio') as Blob).text()).toBe(VOICE_AUDIO);
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('holds review_in_life without completing and without claiming success', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-review',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 721,
+      sourceMessageKey: 'telegram:111:721',
+    });
+    const fetchSpy = mockVoiceTransport((url) => {
+      if (url === voiceReceiptUrl()) {
+        return jsonRes(
+          { success: true, data: { captureId: CAP_VOICE, state: 'unresolved' } },
+          201,
+        );
+      }
+      throw new Error(`unexpected life url ${url}`);
+    });
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 922,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 721 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls).toHaveLength(1);
+    expect(lifeCalls[0].url).toBe(voiceReceiptUrl());
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringMatching(/review/i));
+    expect(ctx.reply).not.toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('rejects association failures without unassociated fallback', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-fail',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 731,
+      sourceMessageKey: 'telegram:111:731',
+    });
+    const fetchSpy = mockVoiceTransport(() =>
+      jsonRes({ success: false, code: 'invalid_audio' }, 422),
+    );
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 923,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 731 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringMatching(/fail/i));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls).toHaveLength(1);
+    expect((lifeCalls[0].init?.body as FormData).get('promptInstanceId')).toBe(
+      'prompt-voice-fail',
+    );
+    await ch.disconnect();
+  });
+
+  it('contains lookup errors without capture or fallback', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-lookup',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 741,
+      sourceMessageKey: 'telegram:111:741',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted(CAP_VOICE));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const handler = getVoiceHandler(lastBotInstance);
+    _setLifePromptDeliveriesDb(undefined as any);
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 924,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 741 },
+      },
+    });
+    try {
+      await handler(ctx);
+    } finally {
+      _initTestDatabase();
+    }
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringMatching(/unavailable/i));
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(ctx.api.getFile).not.toHaveBeenCalled();
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('stops ambiguous voice replies without capture', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-a',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 751,
+      sourceMessageKey: 'telegram:111:751',
+    });
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-b',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 751,
+      sourceMessageKey: 'telegram:111:751',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted(CAP_VOICE));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 925,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 751 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringMatching(/ambiguous/i));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('keeps owner and scope isolation without prompt binding and with one routing decision', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-iso',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 761,
+      sourceMessageKey: 'telegram:111:761',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb'));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const handler = getVoiceHandler(lastBotInstance);
+
+    const intruder = makeVoiceReplyCtx({
+      from: { id: 999 },
+      message: {
+        message_id: 926,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 761 },
+      },
+    });
+    await handler(intruder);
+    expect(opts.onMessage).toHaveBeenCalledTimes(1);
+    const intruderReceipt = lifeCallsForReceipt(fetchSpy).find((c) => c.url === voiceReceiptUrl())?.init?.body as FormData;
+    expect(intruderReceipt).toBeInstanceOf(FormData);
+    expect(intruderReceipt.get('promptInstanceId')).toBeNull();
+    expect(intruderReceipt.get('sourceMessageKey')).toBe('telegram:111:926');
+
+    const groupType = makeVoiceReplyCtx({
+      chat: { id: 111, type: 'group' },
+      message: {
+        message_id: 927,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 761 },
+      },
+    });
+    await handler(groupType);
+    expect(opts.onMessage).toHaveBeenCalledTimes(2);
+
+    fetchSpy.mockRestore();
+    await ch.disconnect();
+  });
+
+  it('leaves foreign-scope voice replies to the unassociated path without prompt metadata', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope: { ...scope, credentialFingerprint: 'fp-foreign' },
+      promptInstanceId: 'prompt-voice-foreign',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 771,
+      sourceMessageKey: 'telegram:111:771',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted('cccccccc-cccc-4ccc-8ccc-cccccccccccc'));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 928,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 771 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+    expect(opts.onMessage).toHaveBeenCalledTimes(1);
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls.length).toBeGreaterThan(0);
+    expect((lifeCalls[0].init?.body as FormData).get('promptInstanceId')).toBeNull();
+    expect(ctx.reply).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('retains the unassociated voice path for non-reply voice with real forwarder', async () => {
+    const fetchSpy = mockVoiceTransport(lifeCompleted('dddddddd-dddd-4ddd-8ddd-dddddddddddd'));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 929,
+        date: Date.now() / 1000,
+        voice: { file_id: 'f1', file_size: 10, duration: 4, mime_type: 'audio/ogg' },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+    expect(opts.onMessage).toHaveBeenCalledTimes(1);
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls.length).toBeGreaterThan(0);
+    const form = lifeCalls[0].init?.body as FormData;
+    expect(form.get('promptInstanceId')).toBeNull();
+    expect(form.get('sourceMessageKey')).toBe('telegram:111:929');
+    expect(await (form.get('audio') as Blob).text()).toBe(VOICE_AUDIO);
     await ch.disconnect();
   });
 });
