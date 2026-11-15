@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { ToolCallEvent } from '../db/tool-events.js';
 import { TelegramChannel } from './telegram.js';
@@ -954,6 +954,507 @@ describe('TelegramChannel', () => {
       expect(opts2.onMessage).toHaveBeenCalledTimes(1);
 
       clearLifeEnv();
+    });
+  });
+
+  describe('/life text capture command', () => {
+    const LIFE_ENV = {
+      LIFE_API_URL: 'https://life.example.com',
+      LIFE_JOURNAL_ID: 'journal-1',
+      LIFE_API_TOKEN: 'test-token-abc',
+    };
+
+    function getLifeHandler(bot: any) {
+      const call = bot.command.mock.calls.find((c: any) => c[0] === 'life');
+      return call?.[1];
+    }
+
+    function getTextHandler(bot: any) {
+      const call = bot.on.mock.calls.find((c: any) => c[0] === 'message:text');
+      return call?.[1];
+    }
+
+    function makeLifeCtx(overrides: any = {}) {
+      return {
+        chat: { id: 111, type: 'private' },
+        message: {
+          message_id: 222,
+          date: Date.now() / 1000,
+          text: '/life hello   world!',
+          entities: [{ type: 'bot_command', offset: 0, length: 5 }],
+        },
+        from: { id: 111, first_name: 'Ceo' },
+        match: 'hello   world!',
+        reply: vi.fn().mockResolvedValue(undefined),
+        me: { username: 'test_bot' },
+        ...overrides,
+      };
+    }
+
+    function setLifeEnv() {
+      process.env.LIFE_API_URL = LIFE_ENV.LIFE_API_URL;
+      process.env.LIFE_JOURNAL_ID = LIFE_ENV.LIFE_JOURNAL_ID;
+      process.env.LIFE_API_TOKEN = LIFE_ENV.LIFE_API_TOKEN;
+    }
+
+    function clearLifeEnv() {
+      delete process.env.LIFE_API_URL;
+      delete process.env.LIFE_JOURNAL_ID;
+      delete process.env.LIFE_API_TOKEN;
+    }
+
+    function jsonRes(body: unknown, status: number): Response {
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    function admittedOpts() {
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      return opts;
+    }
+
+    beforeEach(() => {
+      clearLifeEnv();
+      vi.clearAllMocks();
+      vi.unstubAllGlobals?.();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      clearLifeEnv();
+    });
+
+    it('is registered before the generic text handler', async () => {
+      const ch = new TelegramChannel('token123', makeOpts());
+      await ch.connect();
+      expect(getLifeHandler(lastBotInstance)).toBeDefined();
+      expect(getTextHandler(lastBotInstance)).toBeDefined();
+      const lifeIdx = lastBotInstance.command.mock.calls.findIndex(
+        (c: any) => c[0] === 'life',
+      );
+      expect(lifeIdx).toBeGreaterThanOrEqual(0);
+    });
+
+    it('sends wording-preserving payload through the real typed client to the literal path (201 new)', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(
+          jsonRes(
+            { success: true, data: { captureId: 'cap-1', entryId: 42 } },
+            201,
+          ),
+        );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getLifeHandler(lastBotInstance);
+      const ctx = makeLifeCtx({ match: 'hello   world!  , keep  spacing.' });
+      await handler(ctx);
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const url = String(fetchSpy.mock.calls[0][0]);
+      expect(url).toBe(
+        'https://life.example.com/api/v1/journals/journal-1/text/captures',
+      );
+      expect(url).toContain('/api/v1/journals/journal-1/text/captures');
+      const init = fetchSpy.mock.calls[0][1] as RequestInit;
+      expect(init.method).toBe('POST');
+      const headers = init.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe('Bearer test-token-abc');
+      expect(headers['Content-Type']).toBe('application/json');
+      const bodyJson = JSON.parse(String(init.body)) as Record<string, unknown>;
+      expect(bodyJson).toEqual({
+        sourceMessageKey: 'telegram:111:222',
+        text: 'hello   world!  , keep  spacing.',
+      });
+      expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      const replyText = String(ctx.reply.mock.calls[0][0]);
+      expect(replyText).not.toContain('hello');
+    });
+
+    it('reports saved for confirmed replay (200 replayed true) via real client', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(
+          jsonRes(
+            {
+              success: true,
+              data: { captureId: 'cap-r', entryId: 7, replayed: true },
+            },
+            200,
+          ),
+        );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    });
+
+    it('uses identical redelivery identity across retries', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(
+          jsonRes(
+            {
+              success: true,
+              data: { captureId: 'cap-d', entryId: 9, replayed: true },
+            },
+            200,
+          ),
+        );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getLifeHandler(lastBotInstance);
+      const ctx1 = makeLifeCtx();
+      const ctx2 = makeLifeCtx();
+      await handler(ctx1);
+      await handler(ctx2);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const b1 = JSON.parse(String((fetchSpy.mock.calls[0][1] as RequestInit).body));
+      const b2 = JSON.parse(String((fetchSpy.mock.calls[1][1] as RequestInit).body));
+      expect(b1['sourceMessageKey']).toBe('telegram:111:222');
+      expect(b2['sourceMessageKey']).toBe('telegram:111:222');
+      expect(b1).toEqual(b2);
+    });
+
+    it('supports bot-qualified commands and trims surrounding whitespace', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(
+          jsonRes({ success: true, data: { captureId: 'c', entryId: 1 } }, 201),
+        );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx({
+        message: {
+          message_id: 222,
+          date: Date.now() / 1000,
+          text: '/life@test_bot   spaced   out   ',
+          entities: [{ type: 'bot_command', offset: 0, length: 13 }],
+        },
+        match: '  spaced   out   ',
+      });
+      await getLifeHandler(lastBotInstance)(ctx);
+      const bodyJson = JSON.parse(
+        String((fetchSpy.mock.calls[0][1] as RequestInit).body),
+      ) as Record<string, unknown>;
+      expect(bodyJson['text']).toBe('spaced   out');
+      expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    });
+
+    it('rejects conflicts without reporting saved', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes({ success: false }, 409));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('rejected'),
+      );
+      expect(ctx.reply).not.toHaveBeenCalledWith(
+        expect.stringContaining('Saved'),
+      );
+    });
+
+    it('returns unconfirmed on malformed envelopes', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes({ ok: true }, 201));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('unconfirmed'),
+      );
+    });
+
+    it('returns unconfirmed when entry ID is missing', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(
+          jsonRes({ success: true, data: { captureId: 'cap-x' } }, 201),
+        );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('unconfirmed'),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects blank and oversized payloads without a Life request', async () => {
+      setLifeEnv();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        jsonRes({ success: true, data: { captureId: 'c', entryId: 1 } }, 201),
+      );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getLifeHandler(lastBotInstance);
+
+      const blankCtx = makeLifeCtx({ match: '   ' });
+      await handler(blankCtx);
+      expect(blankCtx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('rejected'),
+      );
+
+      const bigCtx = makeLifeCtx({ match: 'x'.repeat(20001) });
+      await handler(bigCtx);
+      expect(bigCtx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('rejected'),
+      );
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('returns unavailable when Life configuration is missing', async () => {
+      clearLifeEnv();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        jsonRes({ success: true, data: { captureId: 'c', entryId: 1 } }, 201),
+      );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('unavailable'),
+      );
+    });
+
+    it('makes no Life request for unregistered, non-ceo, or non-private chats', async () => {
+      setLifeEnv();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        jsonRes({ success: true, data: { captureId: 'c', entryId: 1 } }, 201),
+      );
+
+      for (const groups of [
+        {},
+        { 'tg:111': { folder: 'ops' } as any },
+      ]) {
+        const opts = makeOpts();
+        (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue(
+          groups,
+        );
+        const ch = new TelegramChannel('token123', opts);
+        await ch.connect();
+        const ctx = makeLifeCtx();
+        await getLifeHandler(lastBotInstance)(ctx);
+        expect(ctx.reply).not.toHaveBeenCalled();
+      }
+
+      const groupOpts = admittedOpts();
+      const groupCh = new TelegramChannel('token123', groupOpts);
+      await groupCh.connect();
+      const groupCtx = makeLifeCtx({
+        chat: { id: 111, type: 'group' },
+      });
+      await getLifeHandler(lastBotInstance)(groupCtx);
+      expect(groupCtx.reply).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('makes no Life request for disallowed senders', async () => {
+      setLifeEnv();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+        jsonRes({ success: true, data: { captureId: 'c', entryId: 1 } }, 201),
+      );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx({ from: { id: 999, first_name: 'Intruder' } });
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+    });
+
+    it('rejects on authentication failure', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes({ success: false }, 401));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('rejected'),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns unconfirmed on server failures', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes({ success: false }, 500));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('unconfirmed'),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns unconfirmed on timeout without retry', async () => {
+      setLifeEnv();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        async (_url: any, init?: any) => {
+          const signal = init?.signal as AbortSignal | undefined;
+          if (signal?.aborted) {
+            throw Object.assign(new Error('aborted'), { name: 'AbortError' });
+          }
+          return new Promise<Response>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => {
+              reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+            });
+          });
+        },
+      );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('unconfirmed'),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns unconfirmed on transport interruption', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockRejectedValue(new Error('network down'));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(ctx);
+      expect(ctx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('unconfirmed'),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it('consumes explicit capture commands before pending-reply handling', async () => {
+      setLifeEnv();
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
+        async (url: any, init?: any) => {
+          const u = String(url);
+          if (u.includes('/decisions/')) {
+            return { ok: true } as Response;
+          }
+          return jsonRes(
+            { success: true, data: { captureId: 'cap-1', entryId: 1 } },
+            201,
+          );
+        },
+      );
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const cbHandler = lastBotInstance.on.mock.calls.find(
+        (c: any) => c[0] === 'callback_query:data',
+      )?.[1];
+      await cbHandler({
+        callbackQuery: { data: 'decision:reject:dec-life-1' },
+        chat: { id: 111 },
+        answerCallbackQuery: vi.fn().mockResolvedValue(undefined),
+        editMessageReplyMarkup: vi.fn().mockResolvedValue(undefined),
+        reply: vi.fn().mockResolvedValue(undefined),
+      });
+
+      const lifeCtx = makeLifeCtx();
+      await getLifeHandler(lastBotInstance)(lifeCtx);
+      expect(fetchSpy.mock.calls.some((c: any) =>
+        String(c[0]).includes('/text/captures'),
+      )).toBe(true);
+      expect(lifeCtx.reply).toHaveBeenCalledWith(
+        expect.stringContaining('Saved'),
+      );
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+
+    it('leaves ordinary text and voice dispatch intact', async () => {
+      setLifeEnv();
+      const audioText = 'fake-audio-bytes';
+      vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode(audioText).buffer as ArrayBuffer,
+      } as Response);
+      const { forwardVoiceCapture } = await import('./life-voice-capture.js');
+      vi.mocked(forwardVoiceCapture).mockResolvedValue({
+        outcome: 'completed',
+        captureId: 'cap-v',
+      });
+
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const textHandler = getTextHandler(lastBotInstance);
+      const msgCtx = {
+        message: { text: 'hello there', date: Date.now() / 1000, message_id: 5 },
+        chat: { id: 111, type: 'private' },
+        from: { id: 111, first_name: 'Ceo' },
+        reply: vi.fn().mockResolvedValue(undefined),
+        me: { username: 'test_bot' },
+      };
+      await textHandler(msgCtx);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      const voiceHandler = lastBotInstance.on.mock.calls.find(
+        (c: any) => c[0] === 'message:voice',
+      )?.[1];
+      expect(voiceHandler).toBeDefined();
+      await voiceHandler({
+        chat: { id: 111, type: 'private' },
+        message: {
+          message_id: 333,
+          date: Date.now() / 1000,
+          voice: { file_id: 'f', file_size: 10, duration: 2, mime_type: 'audio/ogg' },
+        },
+        from: { id: 111, first_name: 'Ceo' },
+        api: { getFile: vi.fn().mockResolvedValue({ file_path: 'v/file.ogg' }) },
+      });
+      expect(opts.onMessage).toHaveBeenCalledTimes(2);
     });
   });
 });

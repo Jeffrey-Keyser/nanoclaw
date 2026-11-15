@@ -13,6 +13,10 @@ import {
   type LifeVoiceCaptureConfig,
 } from './life-voice-capture.js';
 import {
+  forwardTextCapture,
+  LIFE_TEXT_MAX_CHARS,
+} from './life-text-capture.js';
+import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
@@ -43,6 +47,22 @@ export function buildTelegramFileUrl(
 ): string {
   const normalized = filePath.replace(/^\/+/, '');
   return `https://api.telegram.org/file/bot${botToken}/${normalized}`;
+}
+
+export function extractLifePayloadText(ctx: {
+  message?: {
+    text?: string;
+    entities?: Array<{ type: string; offset: number; length: number }>;
+  };
+}): string {
+  const text = ctx.message?.text ?? '';
+  const entities = ctx.message?.entities ?? [];
+  const cmd = entities.find((e) => e.type === 'bot_command' && e.offset === 0);
+  if (!cmd) {
+    const m = text.match(/^\/life(?:@[A-Za-z0-9_]+)?\s*([\s\S]*)$/);
+    return m ? (m[1] ?? '') : '';
+  }
+  return text.slice(cmd.offset + cmd.length);
 }
 
 export interface TelegramChannelOpts {
@@ -496,6 +516,66 @@ export class TelegramChannel implements Channel {
       } catch (err) {
         logger.error({ err }, 'Music command error');
         await ctx.reply('Music Store is offline — try again later.');
+      }
+    });
+
+    this.bot!.command('life', async (ctx) => {
+      try {
+        const chatId = String(ctx.chat.id);
+        const chatJid = `tg:${chatId}`;
+        const group = this.opts.registeredGroups()[chatJid];
+        if (!group || group.folder !== 'ceo') return;
+        if (ctx.chat.type !== 'private') return;
+        const sender =
+          ctx.from?.id !== undefined ? String(ctx.from.id) : '';
+        if (!sender || sender !== chatId) return;
+
+        const raw =
+          typeof (ctx as { match?: unknown }).match === 'string'
+            ? ((ctx as { match?: string }).match as string)
+            : extractLifePayloadText(ctx);
+        const text = (raw ?? '').trim();
+        if (!text || text.length > LIFE_TEXT_MAX_CHARS) {
+          await ctx.reply('Life capture rejected.');
+          return;
+        }
+
+        const lifeConfig = resolveLifeVoiceConfig();
+        if (!lifeConfig) {
+          await ctx.reply('Life capture unavailable.');
+          return;
+        }
+
+        const sourceMessageKey = `telegram:${chatId}:${String(ctx.message.message_id)}`;
+        const result = await forwardTextCapture({
+          fetchImpl: fetch as unknown as (
+            input: string | URL,
+            init?: RequestInit,
+          ) => Promise<Response>,
+          config: lifeConfig,
+          text,
+          sourceMessageKey,
+        });
+        if (
+          result.outcome === 'saved' ||
+          result.outcome === 'replayed'
+        ) {
+          await ctx.reply('Saved to Life.');
+        } else if (result.outcome === 'rejected') {
+          await ctx.reply('Life capture rejected.');
+        } else {
+          await ctx.reply('Life capture unconfirmed.');
+        }
+      } catch {
+        logger.error(
+          { code: 'life_text_handler_failed' },
+          'Life text command failed',
+        );
+        try {
+          await ctx.reply('Life capture unconfirmed.');
+        } catch {
+          // Reply failures stay contained.
+        }
       }
     });
 
