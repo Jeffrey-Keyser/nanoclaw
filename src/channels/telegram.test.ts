@@ -8,6 +8,10 @@ vi.mock('../db/tool-events.js', () => ({
   getRecentToolEvents: vi.fn(() => []),
 }));
 
+vi.mock('./life-voice-capture.js', () => ({
+  forwardVoiceCapture: vi.fn(async () => ({ outcome: 'completed' })),
+}));
+
 // Track all created bot instances for assertions
 let lastBotInstance: any = null;
 
@@ -706,6 +710,250 @@ describe('TelegramChannel', () => {
       const replyText = ctx.reply.mock.calls[0][0] as string;
       expect(replyText.length).toBeLessThanOrEqual(3600); // Allow some padding
       expect(replyText).toContain('truncated');
+    });
+  });
+
+  describe('message:voice Life forwarding', () => {
+    const LIFE_ENV = {
+      LIFE_API_URL: 'https://life.example.com',
+      LIFE_JOURNAL_ID: 'journal-1',
+      LIFE_API_TOKEN: 'test-token-abc',
+    };
+
+    function getVoiceHandler(bot: any) {
+      const call = bot.on.mock.calls.find((c: any) => c[0] === 'message:voice');
+      return call?.[1];
+    }
+
+    function makeVoiceCtx(overrides: any = {}) {
+      return {
+        chat: { id: 111, type: 'private' },
+        message: {
+          message_id: 222,
+          date: Date.now() / 1000,
+          voice: {
+            file_id: 'file-abc',
+            file_size: 1000,
+            duration: 12,
+            mime_type: 'audio/ogg',
+          },
+        },
+        from: { id: 1, first_name: 'Test' },
+        api: {
+          getFile: vi
+            .fn()
+            .mockResolvedValue({ file_path: 'voice/file_123.ogg' }),
+        },
+        ...overrides,
+      };
+    }
+
+    function setLifeEnv() {
+      process.env.LIFE_API_URL = LIFE_ENV.LIFE_API_URL;
+      process.env.LIFE_JOURNAL_ID = LIFE_ENV.LIFE_JOURNAL_ID;
+      process.env.LIFE_API_TOKEN = LIFE_ENV.LIFE_API_TOKEN;
+    }
+
+    function clearLifeEnv() {
+      delete process.env.LIFE_API_URL;
+      delete process.env.LIFE_JOURNAL_ID;
+      delete process.env.LIFE_API_TOKEN;
+    }
+
+    beforeEach(() => {
+      clearLifeEnv();
+      vi.clearAllMocks();
+    });
+
+    it('forwards registered-chat voice via getFile and forwardVoiceCapture with telegram sourceMessageKey', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockResolvedValue({
+        outcome: 'completed',
+        captureId: 'cap-1',
+      });
+
+      const audioText = 'fake-audio-bytes';
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode(audioText).buffer as ArrayBuffer,
+      } as Response);
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      expect(handler).toBeDefined();
+      const ctx = makeVoiceCtx();
+      await handler(ctx);
+
+      expect(ctx.api.getFile).toHaveBeenCalledWith('file-abc');
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const downloadUrl = String(fetchSpy.mock.calls[0][0]);
+      expect(downloadUrl).toContain('https://api.telegram.org/file/bot');
+      expect(downloadUrl).toContain('voice/file_123.ogg');
+
+      expect(forwardVoiceCapture).toHaveBeenCalledTimes(1);
+      const fwdArg = vi.mocked(forwardVoiceCapture).mock.calls[0][0] as any;
+      expect(fwdArg.sourceMessageKey).toBe('telegram:111:222');
+      expect(fwdArg.mimeType).toBe('audio/ogg');
+      expect(fwdArg.durationSeconds).toBe(12);
+      expect(Buffer.from(fwdArg.audio).toString()).toBe(audioText);
+
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      const stored = (opts.onMessage as ReturnType<typeof vi.fn>).mock
+        .calls[0][1] as any;
+      expect(stored.content).toContain('[Voice message]');
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes no Life or Telegram file request for unregistered chats', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockClear();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as Response);
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({});
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      const ctx = makeVoiceCtx();
+      await handler(ctx);
+
+      expect(ctx.api.getFile).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(opts.onMessage).not.toHaveBeenCalled();
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes no Life or Telegram file request when Life config is absent', async () => {
+      clearLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockClear();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as Response);
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      const ctx = makeVoiceCtx();
+      await handler(ctx);
+
+      expect(ctx.api.getFile).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+    });
+
+    it('rejects files over 25 MiB before download', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockClear();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as Response);
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      const ctx = makeVoiceCtx({
+        message: {
+          message_id: 222,
+          date: Date.now() / 1000,
+          voice: {
+            file_id: 'file-big',
+            file_size: 26 * 1024 * 1024,
+            duration: 60,
+          },
+        },
+      });
+      await expect(handler(ctx)).resolves.toBeUndefined();
+
+      expect(ctx.api.getFile).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('does not throw when download or forward fails', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getVoiceHandler(lastBotInstance);
+
+      vi.mocked(forwardVoiceCapture).mockRejectedValueOnce(
+        new Error('life down'),
+      );
+      const fetchOk = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () => new Uint8Array([1, 2, 3]).buffer as ArrayBuffer,
+      } as Response);
+      await expect(handler(makeVoiceCtx())).resolves.toBeUndefined();
+      expect(opts.onMessage).toHaveBeenCalled();
+      fetchOk.mockRestore();
+
+      const opts2 = makeOpts();
+      (opts2.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch2 = new TelegramChannel('token123', opts2);
+      await ch2.connect();
+      const handler2 = getVoiceHandler(lastBotInstance);
+      const failingCtx = makeVoiceCtx({
+        api: { getFile: vi.fn().mockRejectedValue(new Error('tg down')) },
+      });
+      await expect(handler2(failingCtx)).resolves.toBeUndefined();
+      expect(opts2.onMessage).toHaveBeenCalledTimes(1);
+
+      clearLifeEnv();
     });
   });
 });

@@ -9,11 +9,41 @@ import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
+  forwardVoiceCapture,
+  type LifeVoiceCaptureConfig,
+} from './life-voice-capture.js';
+import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+export const TELEGRAM_VOICE_MAX_BYTES = 25 * 1024 * 1024;
+
+export function resolveLifeVoiceConfig(): LifeVoiceCaptureConfig | null {
+  const envVars = readEnvFile([
+    'LIFE_API_URL',
+    'LIFE_JOURNAL_ID',
+    'LIFE_API_TOKEN',
+  ]);
+  const baseUrl =
+    process.env.LIFE_API_URL || envVars.LIFE_API_URL || '';
+  const journalId =
+    process.env.LIFE_JOURNAL_ID || envVars.LIFE_JOURNAL_ID || '';
+  const token =
+    process.env.LIFE_API_TOKEN || envVars.LIFE_API_TOKEN || '';
+  if (!baseUrl || !journalId || !token) return null;
+  return { baseUrl, journalId, token };
+}
+
+export function buildTelegramFileUrl(
+  botToken: string,
+  filePath: string,
+): string {
+  const normalized = filePath.replace(/^\/+/, '');
+  return `https://api.telegram.org/file/bot${botToken}/${normalized}`;
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -43,6 +73,22 @@ interface TelegramNonTextContext {
     first_name?: string;
     username?: string;
     id?: number | string;
+  };
+}
+
+interface VoiceForwardContext {
+  chat: { id: number | string };
+  message: {
+    message_id: number;
+    voice?: {
+      file_id: string;
+      file_size?: number;
+      duration?: number;
+      mime_type?: string;
+    };
+  };
+  api: {
+    getFile: (fileId: string) => Promise<{ file_path?: string; file_size?: number }>;
   };
 }
 
@@ -665,9 +711,23 @@ export class TelegramChannel implements Channel {
 
     this.bot!.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot!.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
-    this.bot!.on('message:voice', (ctx) =>
-      storeNonText(ctx, '[Voice message]'),
-    );
+    this.bot!.on('message:voice', async (ctx) => {
+      storeNonText(ctx, '[Voice message]');
+      try {
+        await this.forwardVoiceToLife(ctx as unknown as VoiceForwardContext);
+      } catch {
+        logger.error(
+          {
+            chatId: String((ctx as unknown as { chat?: { id?: unknown } }).chat?.id),
+            messageId: String(
+              (ctx as unknown as { message?: { message_id?: unknown } })
+                .message?.message_id,
+            ),
+          },
+          'Telegram voice forward failed',
+        );
+      }
+    });
     this.bot!.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot!.on('message:document', (ctx) => {
       const name = ctx.message.document?.file_name || 'file';
@@ -879,6 +939,120 @@ export class TelegramChannel implements Channel {
       `Just left ${merchantName} — how much did you spend? (reply with amount or "skip")`,
     );
     logger.info({ merchantName, ceoChatJid }, 'Grocery spend prompt sent');
+  }
+
+  private async forwardVoiceToLife(ctx: VoiceForwardContext): Promise<void> {
+    const chatId = String(ctx.chat.id);
+    const messageId = String(ctx.message.message_id);
+    const chatJid = `tg:${chatId}`;
+    const group = this.opts.registeredGroups()[chatJid];
+    if (!group) return;
+
+    const lifeConfig = resolveLifeVoiceConfig();
+    if (!lifeConfig) return;
+
+    const voice = ctx.message.voice;
+    const fileId = voice?.file_id;
+    if (!fileId) {
+      logger.warn({ chatId, messageId }, 'Telegram voice missing file id');
+      return;
+    }
+    if (
+      typeof voice?.file_size === 'number' &&
+      voice.file_size > TELEGRAM_VOICE_MAX_BYTES
+    ) {
+      logger.warn(
+        { chatId, messageId, fileSize: voice.file_size },
+        'Telegram voice rejected: file too large',
+      );
+      return;
+    }
+
+    let file: { file_path?: string; file_size?: number };
+    try {
+      file = await ctx.api.getFile(fileId);
+    } catch (err) {
+      logger.error({ chatId, messageId, err }, 'Telegram voice getFile failed');
+      return;
+    }
+    if (
+      typeof file.file_size === 'number' &&
+      file.file_size > TELEGRAM_VOICE_MAX_BYTES
+    ) {
+      logger.warn(
+        { chatId, messageId, fileSize: file.file_size },
+        'Telegram voice rejected: file too large',
+      );
+      return;
+    }
+    const filePath = file.file_path;
+    if (!filePath) {
+      logger.warn({ chatId, messageId }, 'Telegram voice missing file path');
+      return;
+    }
+
+    let audioBytes: Buffer;
+    try {
+      const downloadRes = await fetch(
+        buildTelegramFileUrl(this.botToken, filePath),
+      );
+      if (!downloadRes.ok) {
+        logger.error(
+          { chatId, messageId, status: downloadRes.status },
+          'Telegram voice download failed',
+        );
+        return;
+      }
+      const downloaded = await downloadRes.arrayBuffer();
+      audioBytes = Buffer.from(downloaded);
+    } catch (err) {
+      logger.error(
+        { chatId, messageId, err },
+        'Telegram voice download failed',
+      );
+      return;
+    }
+    if (audioBytes.length > TELEGRAM_VOICE_MAX_BYTES) {
+      logger.warn(
+        { chatId, messageId, fileSize: audioBytes.length },
+        'Telegram voice rejected: file too large',
+      );
+      return;
+    }
+
+    const sourceMessageKey = `telegram:${chatId}:${messageId}`;
+    const mimeType = voice?.mime_type || 'audio/ogg';
+    const durationSeconds =
+      typeof voice?.duration === 'number' ? voice.duration : undefined;
+    try {
+      const result = await forwardVoiceCapture({
+        fetchImpl: fetch as unknown as (
+          input: string | URL,
+          init?: RequestInit,
+        ) => Promise<Response>,
+        config: lifeConfig,
+        audio: audioBytes,
+        mimeType,
+        sourceMessageKey,
+        durationSeconds,
+      });
+      if (result.outcome === 'failed') {
+        logger.warn(
+          { chatId, messageId, code: result.code },
+          'Life voice forward failed',
+        );
+      } else {
+        logger.info(
+          { chatId, messageId, captureId: result.captureId },
+          'Life voice forwarded',
+        );
+      }
+    } catch (err) {
+      logger.error(
+        { chatId, messageId, err },
+        'Life voice forward failed',
+      );
+    }
   }
 
   isConnected(): boolean {
