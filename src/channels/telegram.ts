@@ -21,6 +21,15 @@ import {
   LIFE_TEXT_MAX_CHARS,
 } from './life-text-capture.js';
 import {
+  buildSourceMessageKey as buildArchiveSourceMessageKey,
+  buildSourceThreadKey as buildArchiveSourceThreadKey,
+  extractLifeAskPayload,
+  forwardArchiveQuestion,
+  LIFE_ARCHIVE_QUESTION_GUIDANCE,
+  LIFE_ARCHIVE_QUESTION_MAX_CHARS,
+  splitArchiveAnswerParts,
+} from './life-archive-question.js';
+import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
@@ -599,6 +608,87 @@ export class TelegramChannel implements Channel {
         );
         try {
           await ctx.reply('Life capture unconfirmed.');
+        } catch {
+          // Reply failures stay contained.
+        }
+      }
+    });
+
+    this.bot!.command('lifeask', async (ctx) => {
+      try {
+        const message = ctx.message;
+        if (!message) return;
+        const chatId = String(ctx.chat.id);
+        const chatJid = `tg:${chatId}`;
+        const group = this.opts.registeredGroups()[chatJid];
+        if (!group || group.folder !== 'ceo') return;
+        if (ctx.chat.type !== 'private') return;
+        const sender =
+          ctx.from?.id !== undefined ? String(ctx.from.id) : '';
+        if (!sender || sender !== chatId) return;
+
+        const raw =
+          typeof (ctx as { match?: unknown }).match === 'string'
+            ? ((ctx as { match?: string }).match as string)
+            : extractLifeAskPayload(
+                undefined,
+                message.text ?? '',
+                message.entities as
+                  | Array<{ type: string; offset: number; length: number }>
+                  | undefined,
+              );
+        const text = (raw ?? '').trim();
+        if (!text) {
+          await ctx.reply(LIFE_ARCHIVE_QUESTION_GUIDANCE.usage);
+          return;
+        }
+        if (text.length > LIFE_ARCHIVE_QUESTION_MAX_CHARS) {
+          await ctx.reply(LIFE_ARCHIVE_QUESTION_GUIDANCE.rejected);
+          return;
+        }
+
+        const lifeConfig = resolveLifeVoiceConfig();
+        if (!lifeConfig) {
+          await ctx.reply(LIFE_ARCHIVE_QUESTION_GUIDANCE.unavailable);
+          return;
+        }
+
+        const sourceThreadKey = buildArchiveSourceThreadKey(chatId);
+        const sourceMessageKey = buildArchiveSourceMessageKey(
+          chatId,
+          String(message.message_id),
+        );
+        const result = await forwardArchiveQuestion({
+          fetchImpl: fetch as unknown as (
+            input: string | URL,
+            init?: RequestInit,
+          ) => Promise<Response>,
+          config: lifeConfig,
+          question: text,
+          sourceThreadKey,
+          sourceMessageKey,
+        });
+        if (result.outcome === 'answered' || result.outcome === 'replayed') {
+          const answer = result.answer ?? '';
+          for (const part of splitArchiveAnswerParts(answer)) {
+            try {
+              await ctx.reply(part);
+            } catch {
+              break;
+            }
+          }
+        } else if (result.outcome === 'rejected') {
+          await ctx.reply(LIFE_ARCHIVE_QUESTION_GUIDANCE.rejected);
+        } else {
+          await ctx.reply(LIFE_ARCHIVE_QUESTION_GUIDANCE.unconfirmed);
+        }
+      } catch {
+        logger.error(
+          { code: 'life_archive_question_handler_failed' },
+          'Life archive question command failed',
+        );
+        try {
+          await ctx.reply(LIFE_ARCHIVE_QUESTION_GUIDANCE.unconfirmed);
         } catch {
           // Reply failures stay contained.
         }

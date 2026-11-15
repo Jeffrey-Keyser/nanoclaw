@@ -1741,4 +1741,250 @@ describe('TelegramChannel', () => {
       await ch.disconnect();
     });
   });
+
+  describe('/lifeask archive question command (production handler + real forwarder)', () => {
+    const LIFE_ENV = {
+      LIFE_API_URL: 'https://life.example.com',
+      LIFE_JOURNAL_ID: 'journal-1',
+      LIFE_API_TOKEN: 'test-token-abc',
+    };
+
+    function getAskHandler(bot: any) {
+      const call = bot.command.mock.calls.find((c: any) => c[0] === 'lifeask');
+      return call?.[1];
+    }
+
+    function makeAskCtx(overrides: any = {}) {
+      return {
+        chat: { id: 111, type: 'private' },
+        message: {
+          message_id: 222,
+          date: Date.now() / 1000,
+          text: '/lifeask what happened?',
+          entities: [{ type: 'bot_command', offset: 0, length: 8 }],
+        },
+        from: { id: 111, first_name: 'Ceo' },
+        match: 'what happened?',
+        reply: vi.fn().mockResolvedValue(undefined),
+        me: { username: 'test_bot' },
+        ...overrides,
+      };
+    }
+
+    function setLifeEnv() {
+      process.env.LIFE_API_URL = LIFE_ENV.LIFE_API_URL;
+      process.env.LIFE_JOURNAL_ID = LIFE_ENV.LIFE_JOURNAL_ID;
+      process.env.LIFE_API_TOKEN = LIFE_ENV.LIFE_API_TOKEN;
+    }
+
+    function clearLifeEnv() {
+      delete process.env.LIFE_API_URL;
+      delete process.env.LIFE_JOURNAL_ID;
+      delete process.env.LIFE_API_TOKEN;
+    }
+
+    function jsonRes(body: unknown, status: number): Response {
+      return new Response(JSON.stringify(body), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+
+    function successBody(threadKey: string, answer: string, extra: Record<string, unknown> = {}) {
+      return {
+        success: true,
+        data: {
+          threadKey,
+          turnId: 'turn-1',
+          answer,
+          generation: 'gen-1',
+          entryCount: 2,
+          replayed: false,
+          ...extra,
+        },
+      };
+    }
+
+    function admittedOpts() {
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      return opts;
+    }
+
+    beforeEach(() => {
+      clearLifeEnv();
+      vi.clearAllMocks();
+    });
+
+    afterEach(() => {
+      vi.restoreAllMocks();
+      clearLifeEnv();
+    });
+
+    it('asks the canonical receiver and displays the validated answer as plain text', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes(successBody('telegram:111', 'The archive remembers.'), 201));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeAskCtx();
+      await getAskHandler(lastBotInstance)(ctx);
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      const url = String(fetchSpy.mock.calls[0][0]);
+      expect(url).toBe(
+        'https://life.example.com/api/v1/journals/journal-1/archive-questions',
+      );
+      expect(url).toContain('/api/v1/journals/journal-1/archive-questions');
+      expect(url).not.toContain('/text/captures');
+      const bodyJson = JSON.parse(
+        String((fetchSpy.mock.calls[0][1] as RequestInit).body),
+      );
+      expect(bodyJson).toEqual({
+        sourceThreadKey: 'telegram:111',
+        sourceMessageKey: 'telegram:111:222',
+        question: 'what happened?',
+      });
+      expect(ctx.reply).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledWith('The archive remembers.');
+      expect(opts.onMessage).not.toHaveBeenCalled();
+      await ch.disconnect();
+    });
+
+    it('submits follow-ups with one thread key and handles stored replay', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes(successBody('telegram:111', 'answer'), 201));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getAskHandler(lastBotInstance);
+      await handler(makeAskCtx({ match: 'first' }));
+      await handler(
+        makeAskCtx({
+          match: 'second',
+          message: {
+            message_id: 223,
+            date: Date.now() / 1000,
+            text: '/lifeask second',
+            entities: [{ type: 'bot_command', offset: 0, length: 8 }],
+          },
+        }),
+      );
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const b1 = JSON.parse(String((fetchSpy.mock.calls[0][1] as RequestInit).body));
+      const b2 = JSON.parse(String((fetchSpy.mock.calls[1][1] as RequestInit).body));
+      expect(b1['sourceThreadKey']).toBe('telegram:111');
+      expect(b2['sourceThreadKey']).toBe('telegram:111');
+      expect(b1['sourceMessageKey']).toBe('telegram:111:222');
+      expect(b2['sourceMessageKey']).toBe('telegram:111:223');
+      await ch.disconnect();
+      fetchSpy.mockRestore();
+
+      const replaySpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(
+          jsonRes(successBody('telegram:111', 'Stored.', { replayed: true }), 200),
+        );
+      const opts2 = admittedOpts();
+      const ch2 = new TelegramChannel('token123', opts2);
+      await ch2.connect();
+      const rctx = makeAskCtx({ match: 'same' });
+      await getAskHandler(lastBotInstance)(rctx);
+      expect(replaySpy).toHaveBeenCalledTimes(1);
+      expect(rctx.reply).toHaveBeenCalledWith('Stored.');
+      await ch2.disconnect();
+    });
+
+    it('makes no Life request for admission refusals, invalid input, or missing config', async () => {
+      setLifeEnv();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes(successBody('telegram:111', 'a'), 201));
+      const unregistered = makeOpts();
+      (unregistered.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({});
+      const chU = new TelegramChannel('token123', unregistered);
+      await chU.connect();
+      const uctx = makeAskCtx();
+      await getAskHandler(lastBotInstance)(uctx);
+      expect(uctx.reply).not.toHaveBeenCalled();
+      await chU.disconnect();
+
+      const groupOpts = admittedOpts();
+      const chG = new TelegramChannel('token123', groupOpts);
+      await chG.connect();
+      const gctx = makeAskCtx({ chat: { id: 111, type: 'group' } });
+      await getAskHandler(lastBotInstance)(gctx);
+      expect(gctx.reply).not.toHaveBeenCalled();
+      await chG.disconnect();
+
+      const senderOpts = admittedOpts();
+      const chS = new TelegramChannel('token123', senderOpts);
+      await chS.connect();
+      const sctx = makeAskCtx({ from: { id: 999 } });
+      await getAskHandler(lastBotInstance)(sctx);
+      expect(sctx.reply).not.toHaveBeenCalled();
+      await chS.disconnect();
+
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const blank = makeAskCtx({ match: '   ' });
+      await getAskHandler(lastBotInstance)(blank);
+      expect(blank.reply).toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+      await ch.disconnect();
+
+      clearLifeEnv();
+      const fetchSpy2 = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes(successBody('telegram:111', 'a'), 201));
+      const opts2 = admittedOpts();
+      const ch2 = new TelegramChannel('token123', opts2);
+      await ch2.connect();
+      const mctx = makeAskCtx();
+      await getAskHandler(lastBotInstance)(mctx);
+      expect(fetchSpy2).not.toHaveBeenCalled();
+      expect(mctx.reply).toHaveBeenCalledWith(expect.stringContaining('unavailable'));
+      await ch2.disconnect();
+    });
+
+    it('never surfaces failures as answers and splits long answers in order', async () => {
+      setLifeEnv();
+      const failSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes({ success: false }, 401));
+      const opts = admittedOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const fctx = makeAskCtx();
+      await getAskHandler(lastBotInstance)(fctx);
+      expect(fctx.reply).toHaveBeenCalledWith(expect.stringContaining('rejected'));
+      await ch.disconnect();
+      failSpy.mockRestore();
+
+      setLifeEnv();
+      const longAnswer = 'x'.repeat(4096) + 'y'.repeat(50) + 'END';
+      const longSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue(jsonRes(successBody('telegram:111', longAnswer), 201));
+      const opts2 = admittedOpts();
+      const ch2 = new TelegramChannel('token123', opts2);
+      await ch2.connect();
+      const lctx = makeAskCtx();
+      await getAskHandler(lastBotInstance)(lctx);
+      expect(lctx.reply).toHaveBeenCalledTimes(2);
+      expect(String(lctx.reply.mock.calls[0][0]).length).toBe(4096);
+      expect(String(lctx.reply.mock.calls[0][0]) + String(lctx.reply.mock.calls[1][0])).toBe(
+        longAnswer,
+      );
+      await ch2.disconnect();
+      longSpy.mockRestore();
+    });
+  });
 });
