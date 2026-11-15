@@ -817,6 +817,116 @@ describe('TelegramChannel', () => {
       clearLifeEnv();
     });
 
+    it('invokes the actual forwarder through receipt, process and complete with receiver envelopes', async () => {
+      process.env.LIFE_API_URL = 'https://life.example.com';
+      process.env.LIFE_JOURNAL_ID = '42';
+      process.env.LIFE_API_TOKEN = 'test-token-abc';
+      const actual =
+        await vi.importActual<typeof import('./life-voice-capture.js')>(
+          './life-voice-capture.js',
+        );
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockImplementationOnce(
+        actual.forwardVoiceCapture,
+      );
+
+      const captureId = '99999999-9999-4999-8999-999999999999';
+      const audioText = 'actual-forwarder-voice-bytes-xyz';
+      const receiptUrl =
+        'https://life.example.com/api/v1/journals/42/voice/captures';
+      const lifeCalls: Array<{ url: string; init?: RequestInit }> = [];
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation(async (input: any, init?: any) => {
+          const url = String(input);
+          if (url.includes('api.telegram.org')) {
+            return {
+              ok: true,
+              status: 200,
+              arrayBuffer: async () =>
+                new TextEncoder().encode(audioText).buffer as ArrayBuffer,
+            } as Response;
+          }
+          lifeCalls.push({ url, init });
+          if (url === receiptUrl) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: { captureId, state: 'unfinished' },
+              }),
+              {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          if (url === `${receiptUrl}/${captureId}/process`) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: {
+                  captureId,
+                  state: 'unfinished',
+                  nextAction: 'complete',
+                },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          if (url === `${receiptUrl}/${captureId}/complete`) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: { captureId, state: 'completed' },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          throw new Error(`unexpected url ${url}`);
+        });
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      expect(handler).toBeDefined();
+      const ctx = makeVoiceCtx();
+      await handler(ctx);
+
+      expect(ctx.api.getFile).toHaveBeenCalledWith('file-abc');
+      expect(lifeCalls).toHaveLength(3);
+      expect(lifeCalls[0].url).toBe(receiptUrl);
+      expect(lifeCalls[1].url).toBe(`${receiptUrl}/${captureId}/process`);
+      expect(lifeCalls[2].url).toBe(`${receiptUrl}/${captureId}/complete`);
+      for (const call of lifeCalls) {
+        const headers = call.init?.headers as Record<string, string>;
+        expect(headers['Authorization']).toBe('Bearer test-token-abc');
+      }
+      const receiptBody = lifeCalls[0].init?.body;
+      expect(receiptBody).toBeInstanceOf(FormData);
+      const form = receiptBody as FormData;
+      expect(form.get('sourceMessageKey')).toBe('telegram:111:222');
+      const audioPart = form.get('audio') as Blob;
+      expect(audioPart).toBeInstanceOf(Blob);
+      expect(await audioPart.text()).toBe(audioText);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
     it('makes no Life or Telegram file request for unregistered chats', async () => {
       setLifeEnv();
       const { forwardVoiceCapture } = await import(

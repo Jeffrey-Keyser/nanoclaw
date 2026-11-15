@@ -72,26 +72,62 @@ function errorCodeFromBody(
   body: Record<string, unknown>,
   status: number,
 ): string {
-  const direct = body['code'];
-  if (typeof direct === 'string' && direct.length > 0) return direct;
-  const nested = body['error'];
-  if (typeof nested === 'string' && nested.length > 0) return nested;
-  if (nested !== null && typeof nested === 'object') {
-    const nestedCode = (nested as Record<string, unknown>)['code'];
-    if (typeof nestedCode === 'string' && nestedCode.length > 0)
-      return nestedCode;
+  const data = body['data'];
+  const sources: Record<string, unknown>[] = [body];
+  if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+    sources.push(data as Record<string, unknown>);
   }
-  const nextAction = body['nextAction'];
-  if (typeof nextAction === 'string' && nextAction.length > 0)
-    return nextAction;
+  for (const source of sources) {
+    const direct = source['code'];
+    if (typeof direct === 'string' && direct.length > 0) return direct;
+    const nested = source['error'];
+    if (typeof nested === 'string' && nested.length > 0) return nested;
+    if (nested !== null && typeof nested === 'object') {
+      const nestedCode = (nested as Record<string, unknown>)['code'];
+      if (typeof nestedCode === 'string' && nestedCode.length > 0)
+        return nestedCode;
+    }
+    const nextAction = source['nextAction'];
+    if (typeof nextAction === 'string' && nextAction.length > 0)
+      return nextAction;
+  }
   return `http_${status}`;
 }
 
-function captureIdFromBody(body: Record<string, unknown>): string | undefined {
+function captureIdFromData(data: Record<string, unknown>): string | undefined {
   for (const key of ['captureId', 'id', 'capture_id']) {
-    const value = body[key];
+    const value = data[key];
     if (typeof value === 'string' && value.length > 0) return value;
   }
+  return undefined;
+}
+
+function readDataEnvelope(
+  body: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  if (body['success'] !== true) return undefined;
+  const data = body['data'];
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) {
+    return undefined;
+  }
+  return data as Record<string, unknown>;
+}
+
+function stateFromData(data: Record<string, unknown>): string | undefined {
+  const state = data['state'];
+  return typeof state === 'string' && state.length > 0 ? state : undefined;
+}
+
+function nextActionFromData(data: Record<string, unknown>): string {
+  const nextAction = data['nextAction'];
+  return typeof nextAction === 'string' ? nextAction : '';
+}
+
+function codeFromData(data: Record<string, unknown>): string | undefined {
+  const code = data['code'];
+  if (typeof code === 'string' && code.length > 0) return code;
+  const error = data['error'];
+  if (typeof error === 'string' && error.length > 0) return error;
   return undefined;
 }
 
@@ -102,7 +138,7 @@ export async function forwardVoiceCapture(
   const durationSeconds = input.durationSeconds;
   const base = trimTrailingSlash(config.baseUrl);
   const journalSegment = encodeURIComponent(config.journalId);
-  const receiptUrl = `${base}/api/v1/journals/${journalSegment}/voice-captures`;
+  const receiptUrl = `${base}/api/v1/journals/${journalSegment}/voice/captures`;
   const authHeader = `Bearer ${config.token}`;
 
   try {
@@ -136,10 +172,7 @@ export async function forwardVoiceCapture(
     }
 
     const receiptBody = await readJsonBody(receiptRes);
-    const replayed = receiptBody['replayed'] === true;
-    const receiptOk =
-      receiptRes.status === 201 || (receiptRes.status === 200 && replayed);
-    if (!receiptOk) {
+    if (!receiptRes.ok || receiptBody['success'] !== true) {
       const code = errorCodeFromBody(receiptBody, receiptRes.status);
       logger.warn(
         { sourceMessageKey, status: receiptRes.status, code },
@@ -148,7 +181,20 @@ export async function forwardVoiceCapture(
       return { outcome: 'failed', code };
     }
 
-    const captureId = captureIdFromBody(receiptBody);
+    const receiptData = readDataEnvelope(receiptBody);
+    if (!receiptData) {
+      logger.warn(
+        {
+          sourceMessageKey,
+          status: receiptRes.status,
+          code: 'malformed_envelope',
+        },
+        'Life voice receipt malformed envelope',
+      );
+      return { outcome: 'failed', code: 'malformed_envelope' };
+    }
+
+    const captureId = captureIdFromData(receiptData);
     if (!captureId) {
       logger.warn(
         {
@@ -159,6 +205,48 @@ export async function forwardVoiceCapture(
         'Life voice receipt missing capture id',
       );
       return { outcome: 'failed', code: 'missing_capture_id' };
+    }
+
+    const receiptState = stateFromData(receiptData);
+    const replayed = receiptData['replayed'] === true;
+    const receiptStatusOk =
+      receiptRes.status === 201 ||
+      (receiptRes.status === 200 && replayed === true);
+    if (!receiptStatusOk) {
+      logger.warn(
+        {
+          sourceMessageKey,
+          status: receiptRes.status,
+          code: 'unexpected_status',
+        },
+        'Life voice receipt unexpected status',
+      );
+      return { outcome: 'failed', captureId, code: 'unexpected_status' };
+    }
+
+    if (receiptState === 'completed') {
+      logger.info(
+        { sourceMessageKey, captureId },
+        'Life voice capture already completed',
+      );
+      return { outcome: 'completed', captureId };
+    }
+
+    if (receiptState === 'failed') {
+      const code = codeFromData(receiptData) ?? 'capture_failed';
+      logger.warn(
+        { sourceMessageKey, captureId, code },
+        'Life voice capture failed',
+      );
+      return { outcome: 'failed', captureId, code };
+    }
+
+    if (receiptState === 'unresolved') {
+      logger.info(
+        { sourceMessageKey, captureId },
+        'Life voice held for review',
+      );
+      return { outcome: 'review_in_life', captureId };
     }
 
     const processUrl = `${receiptUrl}/${encodeURIComponent(captureId)}/process`;
@@ -181,7 +269,7 @@ export async function forwardVoiceCapture(
     }
 
     const processBody = await readJsonBody(processRes);
-    if (!processRes.ok) {
+    if (!processRes.ok || processBody['success'] !== true) {
       const code = errorCodeFromBody(processBody, processRes.status);
       logger.warn(
         { sourceMessageKey, captureId, status: processRes.status, code },
@@ -190,16 +278,47 @@ export async function forwardVoiceCapture(
       return { outcome: 'failed', captureId, code };
     }
 
-    const nextAction =
-      typeof processBody['nextAction'] === 'string'
-        ? (processBody['nextAction'] as string)
-        : '';
+    const processData = readDataEnvelope(processBody);
+    if (!processData) {
+      logger.warn(
+        {
+          sourceMessageKey,
+          captureId,
+          status: processRes.status,
+          code: 'malformed_envelope',
+        },
+        'Life voice process malformed envelope',
+      );
+      return { outcome: 'failed', captureId, code: 'malformed_envelope' };
+    }
+
+    const processCaptureId = captureIdFromData(processData);
+    if (!processCaptureId || processCaptureId !== captureId) {
+      logger.warn(
+        {
+          sourceMessageKey,
+          captureId,
+          status: processRes.status,
+          code: 'capture_id_mismatch',
+        },
+        'Life voice process identity mismatch',
+      );
+      return { outcome: 'failed', captureId, code: 'capture_id_mismatch' };
+    }
+
+    const processState = stateFromData(processData);
+    if (processState === 'failed') {
+      const code = codeFromData(processData) ?? 'capture_failed';
+      logger.warn(
+        { sourceMessageKey, captureId, code },
+        'Life voice process capture failed',
+      );
+      return { outcome: 'failed', captureId, code };
+    }
+
+    const nextAction = nextActionFromData(processData);
     if (nextAction === 'redeliver') {
-      const code =
-        typeof processBody['code'] === 'string' &&
-        processBody['code'].length > 0
-          ? (processBody['code'] as string)
-          : 'redeliver';
+      const code = codeFromData(processData) ?? 'redeliver';
       logger.warn(
         { sourceMessageKey, captureId, code, nextAction },
         'Life voice needs redelivery',
@@ -233,14 +352,38 @@ export async function forwardVoiceCapture(
       return { outcome: 'failed', captureId, code: 'fetch_failed' };
     }
 
-    if (!completeRes.ok) {
-      const completeBody = await readJsonBody(completeRes);
+    const completeBody = await readJsonBody(completeRes);
+    if (!completeRes.ok || completeBody['success'] !== true) {
       const code = errorCodeFromBody(completeBody, completeRes.status);
       logger.warn(
         { sourceMessageKey, captureId, status: completeRes.status, code },
         'Life voice complete rejected',
       );
       return { outcome: 'failed', captureId, code };
+    }
+
+    const completeData = readDataEnvelope(completeBody);
+    if (!completeData) {
+      logger.warn(
+        {
+          sourceMessageKey,
+          captureId,
+          status: completeRes.status,
+          code: 'malformed_envelope',
+        },
+        'Life voice complete malformed envelope',
+      );
+      return { outcome: 'failed', captureId, code: 'malformed_envelope' };
+    }
+
+    const completeCaptureId = captureIdFromData(completeData);
+    const completeState = stateFromData(completeData);
+    if (completeCaptureId !== captureId || completeState !== 'completed') {
+      logger.warn(
+        { sourceMessageKey, captureId, code: 'completion_mismatch' },
+        'Life voice completion mismatch',
+      );
+      return { outcome: 'failed', captureId, code: 'completion_mismatch' };
     }
 
     logger.info(
