@@ -1,0 +1,10 @@
+{
+  "repo": "Jeffrey-Keyser/nanoclaw",
+  "verifyCommands": [
+    "npm run lint",
+    "npm run typecheck",
+    "npm run build:core",
+    "npm test"
+  ],
+  "note": "Host bootstrap installs development dependencies before dispatch. Compile with build:core: build also reloads the live service and must not run as a verification command."
+}

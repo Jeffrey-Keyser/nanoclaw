@@ -22,12 +22,6 @@ interface StreamToolResultMessage {
   content?: string | Array<{ type: string; text?: string }>;
 }
 
-interface StreamSystemMessage {
-  type: 'system';
-  subtype?: string;
-  session_id?: string;
-}
-
 interface StreamMessageAny {
   type: string;
   subtype?: string;

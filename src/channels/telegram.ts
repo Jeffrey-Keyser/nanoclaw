@@ -521,6 +521,8 @@ export class TelegramChannel implements Channel {
 
     this.bot!.command('life', async (ctx) => {
       try {
+        const message = ctx.message;
+        if (!message) return;
         const chatId = String(ctx.chat.id);
         const chatJid = `tg:${chatId}`;
         const group = this.opts.registeredGroups()[chatJid];
@@ -546,7 +548,7 @@ export class TelegramChannel implements Channel {
           return;
         }
 
-        const sourceMessageKey = `telegram:${chatId}:${String(ctx.message.message_id)}`;
+        const sourceMessageKey = `telegram:${chatId}:${String(message.message_id)}`;
         const result = await forwardTextCapture({
           fetchImpl: fetch as unknown as (
             input: string | URL,

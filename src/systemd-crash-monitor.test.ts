@@ -1,3 +1,5 @@
+import { EventEmitter } from "node:events";
+import { Readable } from "node:stream";
 import fs from 'fs';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -15,9 +17,9 @@ import {
 } from './systemd-crash-monitor.js';
 
 // Mock child_process.spawn
-vi.mock('child_process', () => {
-  const EventEmitter = require('events');
-  const { Readable } = require('stream');
+vi.mock('child_process', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { Readable } = await import('node:stream');
 
   return {
     spawn: vi.fn(() => {
@@ -206,10 +208,7 @@ describe('systemd-crash-monitor', () => {
 
     it('detects a failed service and emits IPC + notification', async () => {
       const { spawn } = await import('child_process');
-      const EventEmitter = require('events');
-      const { Readable } = require('stream');
 
-      let callCount = 0;
       (spawn as ReturnType<typeof vi.fn>).mockImplementation(
         (cmd: string, args: string[]) => {
           const child = new EventEmitter();
@@ -218,7 +217,6 @@ describe('systemd-crash-monitor', () => {
 
           setTimeout(() => {
             if (cmd === 'systemctl' && args.includes('is-failed')) {
-              callCount++;
               // First service (nanoclaw) is failed, second (agency-hq) is not
               if (args.includes('nanoclaw.service')) {
                 child.stdout.push(null);
@@ -241,7 +239,7 @@ describe('systemd-crash-monitor', () => {
         },
       );
 
-      const mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
+      vi.spyOn(fs, 'mkdirSync').mockReturnValue(undefined);
       const writeSpy = vi.spyOn(fs, 'writeFileSync').mockReturnValue(undefined);
 
       const deps = makeMockDeps();
@@ -267,8 +265,6 @@ describe('systemd-crash-monitor', () => {
 
     it('does not re-alert for already known failures', async () => {
       const { spawn } = await import('child_process');
-      const EventEmitter = require('events');
-      const { Readable } = require('stream');
 
       (spawn as ReturnType<typeof vi.fn>).mockImplementation(
         (cmd: string, args: string[]) => {
@@ -310,8 +306,6 @@ describe('systemd-crash-monitor', () => {
 
     it('sends recovery notification when service comes back', async () => {
       const { spawn } = await import('child_process');
-      const EventEmitter = require('events');
-      const { Readable } = require('stream');
 
       let isServiceFailed = true;
 
@@ -361,11 +355,9 @@ describe('systemd-crash-monitor', () => {
 
     it('skips notification when no main group is registered', async () => {
       const { spawn } = await import('child_process');
-      const EventEmitter = require('events');
-      const { Readable } = require('stream');
 
       (spawn as ReturnType<typeof vi.fn>).mockImplementation(
-        (cmd: string, args: string[]) => {
+        (cmd: string, _args: string[]) => {
           const child = new EventEmitter();
           child.stdout = new Readable({ read() {} });
           child.stderr = new Readable({ read() {} });

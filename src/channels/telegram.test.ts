@@ -1347,7 +1347,14 @@ describe('TelegramChannel', () => {
       const ch = new TelegramChannel('token123', opts);
       await ch.connect();
       const ctx = makeLifeCtx();
-      await getLifeHandler(lastBotInstance)(ctx);
+      vi.useFakeTimers();
+      try {
+        const pending = getLifeHandler(lastBotInstance)(ctx);
+        await vi.advanceTimersByTimeAsync(10000);
+        await pending;
+      } finally {
+        vi.useRealTimers();
+      }
       expect(ctx.reply).toHaveBeenCalledWith(
         expect.stringContaining('unconfirmed'),
       );
@@ -1373,7 +1380,7 @@ describe('TelegramChannel', () => {
     it('consumes explicit capture commands before pending-reply handling', async () => {
       setLifeEnv();
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(
-        async (url: any, init?: any) => {
+        async (url: any, _init?: any) => {
           const u = String(url);
           if (u.includes('/decisions/')) {
             return { ok: true } as Response;
@@ -1408,6 +1415,13 @@ describe('TelegramChannel', () => {
         expect.stringContaining('Saved'),
       );
       expect(opts.onMessage).not.toHaveBeenCalled();
+      // The command leaves the decision reply pending; consume it explicitly.
+      await getTextHandler(lastBotInstance)({
+        ...lifeCtx, message: { ...lifeCtx.message, text: 'skip' },
+      });
+      expect(fetchSpy.mock.calls.some((call) =>
+        String(call[0]).includes('/decisions/dec-life-1'),
+      )).toBe(true);
     });
 
     it('leaves ordinary text and voice dispatch intact', async () => {
