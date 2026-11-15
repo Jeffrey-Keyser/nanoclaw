@@ -109,6 +109,49 @@ describe('forwardTextCapture', () => {
     expectNoSecrets();
   });
 
+  it('includes promptInstanceId in JSON only when supplied', async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      jsonResponse(
+        { success: true, data: { captureId: 'cap-p', entryId: 11 } },
+        201,
+      ),
+    );
+    const result = await forwardTextCapture({
+      fetchImpl,
+      config: config(),
+      text: 'prompt reply',
+      sourceMessageKey: SOURCE_KEY,
+      promptInstanceId: 'prompt-9',
+    });
+    expect(result).toEqual({ outcome: 'saved', captureId: 'cap-p', entryId: 11 });
+    expect(calls).toHaveLength(1);
+    const parsed = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+    expect(parsed).toEqual({
+      sourceMessageKey: SOURCE_KEY,
+      text: 'prompt reply',
+      promptInstanceId: 'prompt-9',
+    });
+    expectNoSecrets();
+  });
+
+  it('omits promptInstanceId when not supplied', async () => {
+    const { fetchImpl, calls } = recordingFetch(() =>
+      jsonResponse(
+        { success: true, data: { captureId: 'cap-q', entryId: 12 } },
+        201,
+      ),
+    );
+    await forwardTextCapture({
+      fetchImpl,
+      config: config(),
+      text: 'plain',
+      sourceMessageKey: SOURCE_KEY,
+    });
+    const parsed = JSON.parse(String(calls[0].init?.body)) as Record<string, unknown>;
+    expect(parsed).toEqual({ sourceMessageKey: SOURCE_KEY, text: 'plain' });
+    expect('promptInstanceId' in parsed).toBe(false);
+  });
+
   it('accepts 200 with replayed true as replayed', async () => {
     const { fetchImpl } = recordingFetch(() =>
       jsonResponse(

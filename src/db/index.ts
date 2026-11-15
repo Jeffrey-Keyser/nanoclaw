@@ -150,12 +150,14 @@ export {
 export {
   LifePromptDeliveryReceipt,
   LifePromptDeliveryScope,
+  LifePromptReplyResolution,
   getLifePromptDeliveryReceipts,
   insertLifePromptDeliveryReceipt,
   isLifePromptDeliveryAcknowledged,
   listLifePromptDeliveryPromptIds,
   listUnacknowledgedLifePromptIds,
   markLifePromptDeliveryAcknowledged,
+  resolveLifePromptReply,
   updateLifePromptDeliverySourceKey,
 } from './life-prompt-deliveries.js';
 

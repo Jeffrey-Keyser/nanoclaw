@@ -16,6 +16,7 @@ export interface ForwardTextCaptureInput {
   config: LifeTextCaptureConfig;
   text: string;
   sourceMessageKey: string;
+  promptInstanceId?: string;
   timeoutMs?: number;
 }
 
@@ -100,10 +101,17 @@ export async function forwardTextCapture(
 
   const url = buildTextCaptureUrl(config.baseUrl, config.journalId);
   const authHeader = `Bearer ${config.token}`;
-  const body = JSON.stringify({
+  const payload: Record<string, unknown> = {
     sourceMessageKey: input.sourceMessageKey,
     text,
-  });
+  };
+  if (
+    typeof input.promptInstanceId === 'string' &&
+    input.promptInstanceId.length > 0
+  ) {
+    payload['promptInstanceId'] = input.promptInstanceId;
+  }
+  const body = JSON.stringify(payload);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);

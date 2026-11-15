@@ -8,6 +8,7 @@ import {
   listLifePromptDeliveryPromptIds,
   listUnacknowledgedLifePromptIds,
   markLifePromptDeliveryAcknowledged,
+  resolveLifePromptReply,
   updateLifePromptDeliverySourceKey,
   type LifePromptDeliveryScope,
 } from './life-prompt-deliveries.js';
@@ -128,6 +129,104 @@ describe('life-prompt-deliveries', () => {
     expect(updated[0].source_message_key).toBe('telegram:111:701.final');
     const other = getLifePromptDeliveryReceipts(OTHER_SCOPE, 'prompt-2');
     expect(other[0].source_message_key).toBe('telegram:111:702');
+  });
+
+  it('resolves any confirmed multipart part before acknowledgment', () => {
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-multi',
+      partIndex: 0,
+      partCount: 2,
+      telegramMessageId: 511,
+      sourceMessageKey: 'telegram:111:511',
+    });
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-multi',
+      partIndex: 1,
+      partCount: 2,
+      telegramMessageId: 512,
+      sourceMessageKey: 'telegram:111:511.512',
+    });
+    expect(isLifePromptDeliveryAcknowledged(SCOPE, 'prompt-multi')).toBe(false);
+    expect(resolveLifePromptReply(SCOPE, 511)).toEqual({
+      status: 'matched',
+      promptInstanceId: 'prompt-multi',
+    });
+    expect(resolveLifePromptReply(SCOPE, 512)).toEqual({
+      status: 'matched',
+      promptInstanceId: 'prompt-multi',
+    });
+  });
+
+  it('keeps resolving persisted receipts after acknowledgment', () => {
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-ack',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 521,
+      sourceMessageKey: 'telegram:111:521',
+    });
+    markLifePromptDeliveryAcknowledged(SCOPE, 'prompt-ack');
+    expect(resolveLifePromptReply(SCOPE, 521)).toEqual({
+      status: 'matched',
+      promptInstanceId: 'prompt-ack',
+    });
+  });
+
+  it('returns unknown for missing messages and non-integer identities', () => {
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-1',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 531,
+      sourceMessageKey: 'telegram:111:531',
+    });
+    expect(resolveLifePromptReply(SCOPE, 999)).toEqual({ status: 'unknown' });
+    expect(resolveLifePromptReply(SCOPE, Number.NaN)).toEqual({ status: 'unknown' });
+  });
+
+  it('refuses foreign scopes with unknown rather than a prompt identity', () => {
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-1',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 541,
+      sourceMessageKey: 'telegram:111:541',
+    });
+    expect(resolveLifePromptReply(OTHER_SCOPE, 541)).toEqual({ status: 'unknown' });
+    expect(
+      resolveLifePromptReply({ ...SCOPE, endpoint: 'https://other.example.com' }, 541),
+    ).toEqual({ status: 'unknown' });
+    expect(
+      resolveLifePromptReply({ ...SCOPE, journalId: 'other-journal' }, 541),
+    ).toEqual({ status: 'unknown' });
+    expect(
+      resolveLifePromptReply({ ...SCOPE, destination: 'tg:222' }, 541),
+    ).toEqual({ status: 'unknown' });
+  });
+
+  it('returns ambiguous when one telegram identity maps to two prompts', () => {
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-a',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 551,
+      sourceMessageKey: 'telegram:111:551',
+    });
+    insertLifePromptDeliveryReceipt({
+      scope: SCOPE,
+      promptInstanceId: 'prompt-b',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 551,
+      sourceMessageKey: 'telegram:111:551',
+    });
+    expect(resolveLifePromptReply(SCOPE, 551)).toEqual({ status: 'ambiguous' });
   });
 
   it('never persists bearer tokens in stored rows', () => {

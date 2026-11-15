@@ -14,8 +14,12 @@ import {
 } from './life-voice-capture.js';
 import {
   LifePromptDeliveryConsumer,
+  credentialFingerprint,
+  normalizeEndpoint,
+  resolveCeoDestination,
   type PromptBotAdapter,
 } from './life-prompt-delivery.js';
+import { resolveLifePromptReply } from '../db/life-prompt-deliveries.js';
 import {
   forwardTextCapture,
   LIFE_TEXT_MAX_CHARS,
@@ -699,6 +703,8 @@ export class TelegramChannel implements Channel {
       // Skip commands
       if (ctx.message.text.startsWith('/')) return;
 
+      if (await this.handleLifePromptTextReply(ctx)) return;
+
       // Check for pending rejection reason flow
       const chatIdKey = String(ctx.chat?.id);
       const pending = pendingRejections.get(chatIdKey);
@@ -1249,6 +1255,129 @@ export class TelegramChannel implements Channel {
         'Life voice forward failed',
       );
     }
+  }
+
+  private async handleLifePromptTextReply(ctx: {
+    message: {
+      text: string;
+      message_id: number;
+      reply_to_message?: { message_id?: unknown };
+    };
+    chat: { id: number | string; type: string };
+    from?: { id?: number | string };
+    reply: (text: string) => Promise<unknown>;
+  }): Promise<boolean> {
+    const rawText = ctx.message?.text;
+    if (typeof rawText !== 'string') return false;
+    const replyToId = (ctx.message as { reply_to_message?: { message_id?: unknown } })
+      ?.reply_to_message?.message_id;
+    if (typeof replyToId !== 'number' || !Number.isInteger(replyToId)) {
+      return false;
+    }
+    const chatId = String((ctx.chat as { id?: unknown })?.id ?? '');
+    if (!chatId) return false;
+    if (ctx.chat?.type !== 'private') return false;
+    const chatJid = `tg:${chatId}`;
+    let groups: Record<string, RegisteredGroup>;
+    try {
+      groups = this.opts.registeredGroups();
+    } catch {
+      return false;
+    }
+    const group = groups[chatJid];
+    if (!group || group.folder !== 'ceo') return false;
+    let ceoDestination: string | null;
+    try {
+      ceoDestination = resolveCeoDestination(groups);
+    } catch {
+      return false;
+    }
+    if (ceoDestination !== chatJid) return false;
+    const sender =
+      ctx.from?.id !== undefined ? String(ctx.from.id) : '';
+    if (!sender || sender !== chatId) return false;
+    const lifeConfig = resolveLifeVoiceConfig();
+    if (!lifeConfig) return false;
+    const scope = {
+      endpoint: normalizeEndpoint(lifeConfig.baseUrl),
+      journalId: lifeConfig.journalId,
+      credentialFingerprint: credentialFingerprint(lifeConfig.token),
+      destination: chatJid,
+    };
+    let resolution: ReturnType<typeof resolveLifePromptReply>;
+    try {
+      resolution = resolveLifePromptReply(scope, replyToId);
+    } catch {
+      logger.warn(
+        { code: 'life_prompt_reply_lookup_failed' },
+        'Life prompt reply lookup failed',
+      );
+      try {
+        await ctx.reply('Life prompt reply unavailable.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    if (resolution.status === 'unknown') return false;
+    if (resolution.status === 'ambiguous') {
+      logger.warn(
+        { code: 'life_prompt_reply_ambiguous' },
+        'Life prompt reply ambiguous',
+      );
+      try {
+        await ctx.reply('Life prompt reply ambiguous.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    const text = rawText.trim();
+    if (!text || text.length > LIFE_TEXT_MAX_CHARS) {
+      try {
+        await ctx.reply('Life capture rejected.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    const sourceMessageKey = `telegram:${chatId}:${String(ctx.message.message_id)}`;
+    let result: Awaited<ReturnType<typeof forwardTextCapture>>;
+    try {
+      result = await forwardTextCapture({
+        fetchImpl: fetch as unknown as (
+          input: string | URL,
+          init?: RequestInit,
+        ) => Promise<Response>,
+        config: lifeConfig,
+        text,
+        sourceMessageKey,
+        promptInstanceId: resolution.promptInstanceId,
+      });
+    } catch {
+      logger.error(
+        { code: 'life_prompt_reply_forward_failed' },
+        'Life prompt reply forward failed',
+      );
+      try {
+        await ctx.reply('Life capture unconfirmed.');
+      } catch {
+        // Reply failures stay contained.
+      }
+      return true;
+    }
+    try {
+      if (result.outcome === 'saved' || result.outcome === 'replayed') {
+        await ctx.reply('Saved to Life.');
+      } else if (result.outcome === 'rejected') {
+        await ctx.reply('Life capture rejected.');
+      } else {
+        await ctx.reply('Life capture unconfirmed.');
+      }
+    } catch {
+      // Reply failures stay contained.
+    }
+    return true;
   }
 
   isConnected(): boolean {

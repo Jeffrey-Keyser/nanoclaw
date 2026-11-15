@@ -69,6 +69,42 @@ export function insertLifePromptDeliveryReceipt(input: {
     );
 }
 
+export type LifePromptReplyResolution =
+  | { status: 'matched'; promptInstanceId: string }
+  | { status: 'unknown' }
+  | { status: 'ambiguous' };
+
+export function resolveLifePromptReply(
+  scope: LifePromptDeliveryScope,
+  telegramMessageId: number,
+): LifePromptReplyResolution {
+  if (!Number.isInteger(telegramMessageId)) {
+    return { status: 'unknown' };
+  }
+  const rows = requireDb()
+    .prepare(
+      `SELECT DISTINCT prompt_instance_id AS promptInstanceId FROM life_prompt_deliveries
+        WHERE endpoint = ? AND journal_id = ? AND credential_fingerprint = ? AND destination = ? AND telegram_message_id = ?`,
+    )
+    .all(
+      scope.endpoint,
+      scope.journalId,
+      scope.credentialFingerprint,
+      scope.destination,
+      telegramMessageId,
+    ) as Array<{ promptInstanceId: unknown }>;
+  const ids = rows
+    .map((row) => row.promptInstanceId)
+    .filter(
+      (value): value is string =>
+        typeof value === 'string' && value.length > 0,
+    );
+  const distinct = [...new Set(ids)];
+  if (distinct.length === 0) return { status: 'unknown' };
+  if (distinct.length > 1) return { status: 'ambiguous' };
+  return { status: 'matched', promptInstanceId: distinct[0] };
+}
+
 export function getLifePromptDeliveryReceipts(
   scope: LifePromptDeliveryScope,
   promptInstanceId: string,
