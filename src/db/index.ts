@@ -7,6 +7,7 @@ import { STORE_DIR } from '../config.js';
 import { _setAgentEventsDb } from './agent-events.js';
 import { _setDispatchSlotsDb } from './dispatch-slots.js';
 import { _setGroupsDb } from './groups.js';
+import { _setLifePromptDeliveriesDb } from './life-prompt-deliveries.js';
 import { _setMessagesDb } from './messages.js';
 import { migrateJsonState, runMigrations } from './migrations.js';
 import { _setOutboundMessagesDb } from './outbound-messages.js';
@@ -16,6 +17,7 @@ import { _setToolEventsDb } from './tool-events.js';
 
 function setAllDbs(database: Database.Database): void {
   _setAgentEventsDb(database);
+  _setLifePromptDeliveriesDb(database);
   _setMessagesDb(database);
   _setSessionsDb(database);
   _setGroupsDb(database);
@@ -144,3 +146,17 @@ export {
   normalizeToolEventsLimit,
   pruneToolEvents,
 } from './tool-events.js';
+
+export {
+  LifePromptDeliveryReceipt,
+  LifePromptDeliveryScope,
+  getLifePromptDeliveryReceipts,
+  insertLifePromptDeliveryReceipt,
+  isLifePromptDeliveryAcknowledged,
+  listLifePromptDeliveryPromptIds,
+  listUnacknowledgedLifePromptIds,
+  markLifePromptDeliveryAcknowledged,
+  updateLifePromptDeliverySourceKey,
+} from './life-prompt-deliveries.js';
+
+export { _setLifePromptDeliveriesDb } from './life-prompt-deliveries.js';

@@ -12,6 +12,39 @@ vi.mock('./life-voice-capture.js', () => ({
   forwardVoiceCapture: vi.fn(async () => ({ outcome: 'completed' })),
 }));
 
+const lifePromptConsumerRecords: Array<{
+  deps: any;
+  start: ReturnType<typeof vi.fn>;
+  stop: ReturnType<typeof vi.fn>;
+  pollOnce: ReturnType<typeof vi.fn>;
+  running: boolean;
+}> = vi.hoisted(() => []);
+
+vi.mock('./life-prompt-delivery.js', () => {
+  class StubLifePromptDeliveryConsumer {
+    deps: unknown;
+    running = false;
+    start: ReturnType<typeof vi.fn>;
+    stop: ReturnType<typeof vi.fn>;
+    pollOnce: ReturnType<typeof vi.fn>;
+
+    constructor(deps: unknown) {
+      this.deps = deps;
+      this.start = vi.fn(() => {
+        this.running = true;
+      });
+      this.stop = vi.fn(() => {
+        this.running = false;
+      });
+      this.pollOnce = vi.fn(async () => undefined);
+      lifePromptConsumerRecords.push(
+        this as unknown as (typeof lifePromptConsumerRecords)[number],
+      );
+    }
+  }
+  return { LifePromptDeliveryConsumer: StubLifePromptDeliveryConsumer };
+});
+
 // Track all created bot instances for assertions
 let lastBotInstance: any = null;
 
@@ -22,10 +55,11 @@ vi.mock('grammy', () => {
 
   class MockBot {
     api = {
-      sendMessage: vi.fn().mockResolvedValue({}),
+      sendMessage: vi.fn().mockResolvedValue({ message_id: 601 }),
       sendChatAction: vi.fn().mockResolvedValue(true),
       setWebhook: vi.fn().mockResolvedValue(true),
       deleteWebhook: vi.fn().mockResolvedValue(true),
+      getChat: vi.fn(async () => ({ type: 'private' })),
     };
     botInfo = { username: 'test_bot', id: 123 };
     command = vi.fn();
@@ -60,6 +94,7 @@ function makeOpts(): TelegramChannelOpts {
 describe('TelegramChannel', () => {
   beforeEach(() => {
     lastBotInstance = null;
+    lifePromptConsumerRecords.length = 0;
   });
 
   describe('constructor', () => {
@@ -1579,6 +1614,131 @@ describe('TelegramChannel', () => {
         api: { getFile: vi.fn().mockResolvedValue({ file_path: 'v/file.ogg' }) },
       });
       expect(opts.onMessage).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('life prompt delivery wiring', () => {
+    const LIFE_ENV = {
+      LIFE_API_URL: 'https://life.example.com',
+      LIFE_JOURNAL_ID: 'journal-1',
+      LIFE_API_TOKEN: 'test-token-abc',
+    };
+
+    function setLifeEnv() {
+      process.env.LIFE_API_URL = LIFE_ENV.LIFE_API_URL;
+      process.env.LIFE_JOURNAL_ID = LIFE_ENV.LIFE_JOURNAL_ID;
+      process.env.LIFE_API_TOKEN = LIFE_ENV.LIFE_API_TOKEN;
+    }
+
+    function clearLifeEnv() {
+      delete process.env.LIFE_API_URL;
+      delete process.env.LIFE_JOURNAL_ID;
+      delete process.env.LIFE_API_TOKEN;
+    }
+
+    function ceoOpts() {
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      return opts;
+    }
+
+    beforeEach(() => {
+      clearLifeEnv();
+    });
+
+    afterEach(() => {
+      clearLifeEnv();
+      vi.restoreAllMocks();
+    });
+
+    it('starts one consumer on polling connect and stops it on disconnect', async () => {
+      setLifeEnv();
+      const opts = ceoOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      expect(lifePromptConsumerRecords).toHaveLength(1);
+      const record = lifePromptConsumerRecords[0];
+      expect(record.start).toHaveBeenCalledTimes(1);
+      expect(record.running).toBe(true);
+      expect(ch.getLifePromptConsumer()).not.toBeNull();
+
+      await ch.disconnect();
+      expect(record.stop).toHaveBeenCalledTimes(1);
+      expect(ch.getLifePromptConsumer()).toBeNull();
+      expect(ch.isConnected()).toBe(false);
+    });
+
+    it('starts and stops the same consumer in webhook mode', async () => {
+      setLifeEnv();
+      const opts = ceoOpts();
+      const ch = new TelegramChannel(
+        'token123',
+        opts,
+        'https://example.com/telegram',
+      );
+      await ch.connect();
+
+      expect(lifePromptConsumerRecords).toHaveLength(1);
+      expect(lifePromptConsumerRecords[0].start).toHaveBeenCalledTimes(1);
+      expect(ch.getLifePromptConsumer()).not.toBeNull();
+
+      await ch.disconnect();
+      expect(lifePromptConsumerRecords[0].stop).toHaveBeenCalledTimes(1);
+      expect(ch.getLifePromptConsumer()).toBeNull();
+      expect(ch.isConnected()).toBe(false);
+    });
+
+    it('passes live Life configuration and ceo routing through to the consumer', async () => {
+      setLifeEnv();
+      const opts = ceoOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const deps = lifePromptConsumerRecords[0].deps;
+      expect(deps.configProvider()).toEqual({
+        baseUrl: 'https://life.example.com',
+        journalId: 'journal-1',
+        token: 'test-token-abc',
+      });
+      expect(deps.groupsProvider()).toEqual(
+        expect.objectContaining({ 'tg:111': expect.objectContaining({ folder: 'ceo' }) }),
+      );
+
+      const bot = deps.botProvider();
+      expect(bot).not.toBeNull();
+      await expect(bot.getChatType('111')).resolves.toBe('private');
+      await expect(bot.sendText('111', 'hello')).resolves.toBe(601);
+      expect(lastBotInstance.api.sendMessage).toHaveBeenCalledWith('111', 'hello');
+
+      await ch.disconnect();
+    });
+
+    it('provides no bot before connect and none after disconnect', async () => {
+      setLifeEnv();
+      const opts = ceoOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const deps = lifePromptConsumerRecords[0].deps;
+      expect(deps.botProvider()).not.toBeNull();
+      await ch.disconnect();
+      expect(deps.botProvider()).toBeNull();
+    });
+
+    it('replaces the consumer on reconnection without leaking the previous one', async () => {
+      setLifeEnv();
+      const opts = ceoOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const first = lifePromptConsumerRecords[0];
+      await ch.disconnect();
+      await ch.connect();
+      expect(lifePromptConsumerRecords).toHaveLength(2);
+      expect(first.stop).toHaveBeenCalledTimes(1);
+      expect(lifePromptConsumerRecords[1].start).toHaveBeenCalledTimes(1);
+      await ch.disconnect();
     });
   });
 });

@@ -13,6 +13,10 @@ import {
   type LifeVoiceCaptureConfig,
 } from './life-voice-capture.js';
 import {
+  LifePromptDeliveryConsumer,
+  type PromptBotAdapter,
+} from './life-prompt-delivery.js';
+import {
   forwardTextCapture,
   LIFE_TEXT_MAX_CHARS,
 } from './life-text-capture.js';
@@ -69,6 +73,24 @@ export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+}
+
+class GrammyPromptBotAdapter implements PromptBotAdapter {
+  constructor(private api: Api) {}
+
+  async getChatType(chatId: string): Promise<string | undefined> {
+    const chat = (await this.api.getChat(chatId)) as unknown as {
+      type?: string;
+    };
+    return chat.type;
+  }
+
+  async sendText(chatId: string, text: string): Promise<number> {
+    const message = (await this.api.sendMessage(chatId, text)) as unknown as {
+      message_id: number;
+    };
+    return message.message_id;
+  }
 }
 
 interface SmartPlaylistFilters {
@@ -159,6 +181,7 @@ export class TelegramChannel implements Channel {
   private webhookServer: Server | null = null;
   private webhookSecretToken: string;
   private useWebhook: boolean;
+  private lifePromptConsumer: LifePromptDeliveryConsumer | null = null;
 
   constructor(
     botToken: string,
@@ -187,6 +210,7 @@ export class TelegramChannel implements Channel {
     } else {
       await this.startPolling();
     }
+    this.startLifePromptDelivery();
   }
 
   private setupHandlers(): void {
@@ -1141,11 +1165,35 @@ export class TelegramChannel implements Channel {
     return this.bot !== null;
   }
 
+  getLifePromptConsumer(): LifePromptDeliveryConsumer | null {
+    return this.lifePromptConsumer;
+  }
+
+  private startLifePromptDelivery(): void {
+    this.stopLifePromptDelivery();
+    const consumer = new LifePromptDeliveryConsumer({
+      configProvider: () => resolveLifeVoiceConfig(),
+      groupsProvider: () => this.opts.registeredGroups(),
+      botProvider: () =>
+        this.bot ? new GrammyPromptBotAdapter(this.bot.api) : null,
+    });
+    this.lifePromptConsumer = consumer;
+    consumer.start();
+  }
+
+  private stopLifePromptDelivery(): void {
+    if (this.lifePromptConsumer) {
+      this.lifePromptConsumer.stop();
+      this.lifePromptConsumer = null;
+    }
+  }
+
   ownsJid(jid: string): boolean {
     return jid.startsWith('tg:');
   }
 
   async disconnect(): Promise<void> {
+    this.stopLifePromptDelivery();
     if (this.bot) {
       if (this.useWebhook) {
         // Delete webhook registration so Telegram stops sending updates
