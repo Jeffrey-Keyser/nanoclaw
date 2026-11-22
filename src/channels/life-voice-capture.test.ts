@@ -263,6 +263,110 @@ describe('forwardVoiceCapture', () => {
     expectNoSecrets();
   });
 
+  it('carries owner-review indication for review_ready with resolve without calling complete', async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_RESOLVE, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_RESOLVE, state: 'review_ready', nextAction: 'resolve' },
+          },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+    });
+
+    expect(result).toEqual({
+      outcome: 'review_in_life',
+      captureId: CAP_RESOLVE,
+      needsOwnerReview: true,
+    });
+    expect(calls).toHaveLength(2);
+    expect(calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+    expect(calls.some((c) => c.url.includes('resolve'))).toBe(false);
+    expectNoSecrets();
+  });
+
+  it('carries no owner-review indication when review_ready has another action', async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_RESOLVE, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_RESOLVE, state: 'review_ready', nextAction: 'wait' },
+          },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+    });
+
+    expect(result).toEqual({ outcome: 'review_in_life', captureId: CAP_RESOLVE });
+    expect(calls).toHaveLength(2);
+    expectNoSecrets();
+  });
+
+  it('carries no owner-review indication when resolve has another state', async () => {
+    const { fetchImpl } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_RESOLVE, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_RESOLVE, state: 'unfinished', nextAction: 'resolve' },
+          },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+    });
+
+    expect(result).toEqual({ outcome: 'review_in_life', captureId: CAP_RESOLVE });
+    expectNoSecrets();
+  });
+
   it('returns review_in_life for a wait nextAction without calling complete', async () => {
     const { fetchImpl, calls } = recordingFetch((url) => {
       if (url === receiptUrl()) {

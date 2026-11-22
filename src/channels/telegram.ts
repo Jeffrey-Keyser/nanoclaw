@@ -42,6 +42,9 @@ import {
 
 export const TELEGRAM_VOICE_MAX_BYTES = 25 * 1024 * 1024;
 
+export const LIFE_VOICE_REVIEW_INSTRUCTION =
+  'Voice note needs review in Life. Open Life, go to Today and finish the note under Unfinished voice notes.';
+
 export function resolveLifeVoiceConfig(): LifeVoiceCaptureConfig | null {
   const envVars = readEnvFile([
     'LIFE_API_URL',
@@ -1266,11 +1269,52 @@ export class TelegramChannel implements Channel {
           'Life voice forwarded',
         );
       }
+      if (
+        result.outcome === 'review_in_life' &&
+        result.needsOwnerReview === true
+      ) {
+        await this.sendVoiceReviewInstruction(ctx, chatId, chatJid);
+      }
     } catch (err) {
       logger.error(
         { chatId, messageId, err },
         'Life voice forward failed',
       );
+    }
+  }
+
+  private async sendVoiceReviewInstruction(
+    ctx: VoiceForwardContext,
+    chatId: string,
+    chatJid: string,
+  ): Promise<void> {
+    try {
+      if (ctx.chat.type !== 'private') return;
+      const sender =
+        ctx.from?.id !== undefined ? String(ctx.from.id) : '';
+      if (!sender || sender !== chatId) return;
+      let groups: Record<string, RegisteredGroup>;
+      try {
+        groups = this.opts.registeredGroups();
+      } catch {
+        return;
+      }
+      const group = groups[chatJid];
+      if (!group || group.folder !== 'ceo') return;
+      let ownerDestination: string | null;
+      try {
+        ownerDestination = resolveCeoDestination(groups);
+      } catch {
+        return;
+      }
+      if (!ownerDestination || ownerDestination !== chatJid) return;
+      try {
+        await ctx.reply?.(LIFE_VOICE_REVIEW_INSTRUCTION);
+      } catch {
+        // Reply failures stay contained.
+      }
+    } catch {
+      // Review guidance never throws.
     }
   }
 

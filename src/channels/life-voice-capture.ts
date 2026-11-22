@@ -30,6 +30,7 @@ export interface ForwardVoiceCaptureResult {
   outcome: ForwardVoiceCaptureOutcome;
   captureId?: string;
   code?: string;
+  needsOwnerReview?: boolean;
 }
 
 function trimTrailingSlash(value: string): string {
@@ -329,6 +330,13 @@ export async function forwardVoiceCapture(
         'Life voice needs redelivery',
       );
       return { outcome: 'failed', captureId, code };
+    }
+    if (processState === 'review_ready' && nextAction === 'resolve') {
+      logger.info(
+        { sourceMessageKey, captureId, nextAction },
+        'Life voice held for review',
+      );
+      return { outcome: 'review_in_life', captureId, needsOwnerReview: true };
     }
     if (nextAction !== 'complete') {
       logger.info(

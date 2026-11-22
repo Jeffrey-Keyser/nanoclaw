@@ -20,7 +20,9 @@ const lifePromptConsumerRecords: Array<{
   running: boolean;
 }> = vi.hoisted(() => []);
 
-vi.mock('./life-prompt-delivery.js', () => {
+vi.mock('./life-prompt-delivery.js', async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import('./life-prompt-delivery.js')>();
   class StubLifePromptDeliveryConsumer {
     deps: unknown;
     running = false;
@@ -42,7 +44,10 @@ vi.mock('./life-prompt-delivery.js', () => {
       );
     }
   }
-  return { LifePromptDeliveryConsumer: StubLifePromptDeliveryConsumer };
+  return {
+    ...actual,
+    LifePromptDeliveryConsumer: StubLifePromptDeliveryConsumer,
+  };
 });
 
 // Track all created bot instances for assertions
@@ -1098,6 +1103,188 @@ describe('TelegramChannel', () => {
       await expect(handler2(failingCtx)).resolves.toBeUndefined();
       expect(opts2.onMessage).toHaveBeenCalledTimes(1);
 
+      clearLifeEnv();
+    });
+
+    it('sends one fixed review instruction for owner review without a completion call', async () => {
+      setLifeEnv();
+      const { LIFE_VOICE_REVIEW_INSTRUCTION } = await import('./telegram.js');
+      const { forwardVoiceCapture: fwd } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(fwd).mockResolvedValue({
+        outcome: 'review_in_life',
+        captureId: 'cap-review-1',
+        needsOwnerReview: true,
+      });
+
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode('audio-bytes').buffer as ArrayBuffer,
+      } as Response);
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      const ctx = {
+        ...makeVoiceCtx(),
+        chat: { id: 111, type: 'private' },
+        from: { id: 111, first_name: 'Ceo' },
+        reply: vi.fn().mockResolvedValue(undefined),
+      };
+      await handler(ctx);
+
+      expect(fwd).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledTimes(1);
+      expect(ctx.reply).toHaveBeenCalledWith(LIFE_VOICE_REVIEW_INSTRUCTION);
+      const replyText = String(ctx.reply.mock.calls[0][0]);
+      expect(replyText).toContain('Today');
+      expect(replyText).toContain('Unfinished voice notes');
+      expect(replyText).not.toContain('cap-review-1');
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('sends no new instruction for wait, completed, failed and malformed outcomes', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode('audio-bytes').buffer as ArrayBuffer,
+      } as Response);
+
+      for (const outcome of [
+        { outcome: 'review_in_life', captureId: 'cap-wait' },
+        { outcome: 'completed', captureId: 'cap-done' },
+        { outcome: 'failed', code: 'boom' },
+      ] as const) {
+        vi.mocked(forwardVoiceCapture).mockResolvedValueOnce(outcome as any);
+        const opts = makeOpts();
+        (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+          'tg:111': { folder: 'ceo' } as any,
+        });
+        const ch = new TelegramChannel('token123', opts);
+        await ch.connect();
+        const handler = getVoiceHandler(lastBotInstance);
+        const ctx = {
+          ...makeVoiceCtx(),
+          chat: { id: 111, type: 'private' },
+          from: { id: 111, first_name: 'Ceo' },
+          reply: vi.fn().mockResolvedValue(undefined),
+        };
+        await handler(ctx);
+        expect(ctx.reply).not.toHaveBeenCalled();
+        await ch.disconnect();
+      }
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('sends no review instruction for group chats, other senders and missing or ambiguous destinations', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode('audio-bytes').buffer as ArrayBuffer,
+      } as Response);
+
+      async function runCase(groups: Record<string, unknown>, ctxOverride: any) {
+        vi.mocked(forwardVoiceCapture).mockResolvedValueOnce({
+          outcome: 'review_in_life',
+          captureId: 'cap-review-1',
+          needsOwnerReview: true,
+        } as any);
+        const opts = makeOpts();
+        (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue(
+          groups as any,
+        );
+        const ch = new TelegramChannel('token123', opts);
+        await ch.connect();
+        const handler = getVoiceHandler(lastBotInstance);
+        const ctx = {
+          ...makeVoiceCtx(),
+          chat: { id: 111, type: 'private' },
+          from: { id: 111, first_name: 'Ceo' },
+          reply: vi.fn().mockResolvedValue(undefined),
+          ...ctxOverride,
+        };
+        await handler(ctx);
+        const replied = (ctx.reply as ReturnType<typeof vi.fn>).mock.calls.length;
+        await ch.disconnect();
+        return replied;
+      }
+
+      expect(
+        await runCase({ 'tg:111': { folder: 'ceo' } as any }, { chat: { id: 111, type: 'group' } }),
+      ).toBe(0);
+      expect(
+        await runCase({ 'tg:111': { folder: 'ceo' } as any }, { from: { id: 999 } }),
+      ).toBe(0);
+      expect(await runCase({}, {})).toBe(0);
+      expect(
+        await runCase(
+          { 'tg:111': { folder: 'ceo' } as any, 'tg:222': { folder: 'ceo' } as any },
+          {},
+        ),
+      ).toBe(0);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('contains reply failure locally without another Life request', async () => {
+      setLifeEnv();
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockResolvedValue({
+        outcome: 'review_in_life',
+        captureId: 'cap-review-1',
+        needsOwnerReview: true,
+      } as any);
+      const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue({
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode('audio-bytes').buffer as ArrayBuffer,
+      } as Response);
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getVoiceHandler(lastBotInstance);
+      const ctx = {
+        ...makeVoiceCtx(),
+        chat: { id: 111, type: 'private' },
+        from: { id: 111, first_name: 'Ceo' },
+        reply: vi.fn().mockRejectedValue(new Error('send failed')),
+      };
+      await expect(handler(ctx)).resolves.toBeUndefined();
+      expect(forwardVoiceCapture).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
       clearLifeEnv();
     });
   });
