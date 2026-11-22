@@ -45,6 +45,30 @@ export const TELEGRAM_VOICE_MAX_BYTES = 25 * 1024 * 1024;
 export const LIFE_VOICE_REVIEW_INSTRUCTION =
   'Voice note needs review in Life. Open Life, go to Today and finish the note under Unfinished voice notes.';
 
+export const LIFE_VOICE_PROCESSING_STATUS = 'Sent to Life for processing.';
+export const LIFE_VOICE_SAVED_STATUS = 'Saved to Life.';
+export const LIFE_VOICE_UNCONFIRMED_STATUS = 'Life save unconfirmed.';
+export const LIFE_VOICE_STATUS_TIMEOUT_MS = 5000;
+
+function withStatusDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('life_voice_status_timeout')), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+function extractStatusMessageId(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isInteger(value)) return value;
+  if (value !== null && typeof value === 'object') {
+    const id = (value as { message_id?: unknown }).message_id;
+    if (typeof id === 'number' && Number.isInteger(id)) return id;
+  }
+  return undefined;
+}
+
 export function resolveLifeVoiceConfig(): LifeVoiceCaptureConfig | null {
   const envVars = readEnvFile([
     'LIFE_API_URL',
@@ -149,8 +173,14 @@ interface VoiceForwardContext {
   from?: { id?: number | string };
   api: {
     getFile: (fileId: string) => Promise<{ file_path?: string; file_size?: number }>;
+    editMessageText?: (
+      chatId: string | number,
+      messageId: number,
+      text: string,
+    ) => Promise<unknown>;
   };
   reply?: (text: string) => Promise<unknown>;
+  editMessageText?: (text: string) => Promise<unknown>;
 }
 
 function getTelegramChatTitle(chat: { title?: unknown }): string | undefined {
@@ -1246,6 +1276,28 @@ export class TelegramChannel implements Channel {
     const mimeType = voice?.mime_type || 'audio/ogg';
     const durationSeconds =
       typeof voice?.duration === 'number' ? voice.duration : undefined;
+    const replyToId = ctx.message.reply_to_message?.message_id;
+    const isOrdinaryNote =
+      typeof replyToId !== 'number' || !Number.isInteger(replyToId);
+    const statusEligible =
+      isOrdinaryNote && this.isVoiceStatusEligible(ctx, chatId, chatJid);    let statusMessageId: number | undefined;
+    let statusSendPromise: Promise<void> | undefined;
+    const requestStatus = (): void => {
+      if (!statusEligible || typeof ctx.reply !== 'function') return;
+      if (statusSendPromise !== undefined) return;
+      statusSendPromise = (async () => {
+        try {
+          const sent = await withStatusDeadline(
+            ctx.reply!(LIFE_VOICE_PROCESSING_STATUS),
+            LIFE_VOICE_STATUS_TIMEOUT_MS,
+          );
+          const id = extractStatusMessageId(sent);
+          if (id !== undefined) statusMessageId = id;
+        } catch {
+          // Status send failures stay contained; fallback handled after settle.
+        }
+      })();
+    };
     try {
       const result = await forwardVoiceCapture({
         fetchImpl: fetch as unknown as (
@@ -1257,6 +1309,7 @@ export class TelegramChannel implements Channel {
         mimeType,
         sourceMessageKey,
         durationSeconds,
+        ...(statusEligible ? { onProcessDispatch: requestStatus } : {}),
       });
       if (result.outcome === 'failed') {
         logger.warn(
@@ -1269,10 +1322,30 @@ export class TelegramChannel implements Channel {
           'Life voice forwarded',
         );
       }
-      if (
+      if (statusSendPromise !== undefined) {
+        try {
+          await statusSendPromise;
+        } catch {
+          // Contained above; never throws.
+        }
+      }
+      const needsOwnerReview =
         result.outcome === 'review_in_life' &&
-        result.needsOwnerReview === true
-      ) {
+        result.needsOwnerReview === true;
+      if (statusMessageId !== undefined) {
+        const updateText = needsOwnerReview
+          ? LIFE_VOICE_REVIEW_INSTRUCTION
+          : result.outcome === 'completed'
+            ? LIFE_VOICE_SAVED_STATUS
+            : LIFE_VOICE_UNCONFIRMED_STATUS;
+        const edited = await this.editVoiceStatus(ctx, chatId, statusMessageId, updateText);
+        if (edited || !needsOwnerReview) {
+          return;
+        }
+        await this.sendVoiceReviewInstruction(ctx, chatId, chatJid);
+        return;
+      }
+      if (needsOwnerReview) {
         await this.sendVoiceReviewInstruction(ctx, chatId, chatJid);
       }
     } catch (err) {
@@ -1280,6 +1353,65 @@ export class TelegramChannel implements Channel {
         { chatId, messageId, err },
         'Life voice forward failed',
       );
+    }
+  }
+
+  private isVoiceStatusEligible(
+    ctx: VoiceForwardContext,
+    chatId: string,
+    chatJid: string,
+  ): boolean {
+    try {
+      if (ctx.chat.type !== 'private') return false;
+      const sender =
+        ctx.from?.id !== undefined ? String(ctx.from.id) : '';
+      if (!sender || sender !== chatId) return false;
+      let groups: Record<string, RegisteredGroup>;
+      try {
+        groups = this.opts.registeredGroups();
+      } catch {
+        return false;
+      }
+      const group = groups[chatJid];
+      if (!group || group.folder !== 'ceo') return false;
+      let ownerDestination: string | null;
+      try {
+        ownerDestination = resolveCeoDestination(groups);
+      } catch {
+        return false;
+      }
+      return ownerDestination === chatJid;
+    } catch {
+      return false;
+    }
+  }
+
+  private async editVoiceStatus(
+    ctx: VoiceForwardContext,
+    chatId: string,
+    statusMessageId: number,
+    text: string,
+  ): Promise<boolean> {
+    try {
+      const apiEdit = ctx.api?.editMessageText;
+      if (typeof apiEdit === 'function') {
+        await withStatusDeadline(
+          apiEdit.call(ctx.api, chatId, statusMessageId, text),
+          LIFE_VOICE_STATUS_TIMEOUT_MS,
+        );
+        return true;
+      }
+      const ctxEdit = ctx.editMessageText;
+      if (typeof ctxEdit === 'function') {
+        await withStatusDeadline(
+          ctxEdit.call(ctx, text),
+          LIFE_VOICE_STATUS_TIMEOUT_MS,
+        );
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
     }
   }
 

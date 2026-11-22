@@ -19,6 +19,7 @@ export interface ForwardVoiceCaptureInput {
   sourceMessageKey: string;
   promptInstanceId?: string;
   durationSeconds?: number;
+  onProcessDispatch?: () => void;
 }
 
 export type ForwardVoiceCaptureOutcome =
@@ -256,6 +257,13 @@ export async function forwardVoiceCapture(
     }
 
     const processUrl = `${receiptUrl}/${encodeURIComponent(captureId)}/process`;
+    if (input.onProcessDispatch) {
+      try {
+        input.onProcessDispatch();
+      } catch {
+        // Status notification stays failure-isolated; Life workflow continues.
+      }
+    }
     let processRes: Response;
     try {
       processRes = await fetchImpl(processUrl, {
