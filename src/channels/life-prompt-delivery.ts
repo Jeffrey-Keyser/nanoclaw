@@ -47,6 +47,8 @@ export interface LifePromptDeliveryDeps {
   requestTimeoutMs?: number;
 }
 
+const CONVERSATION_STARTER_LABEL = 'Conversation starter';
+
 const KIND_LABELS: Record<string, string> = {
   morning: 'Morning check-in',
   evening: 'Evening reflection',
@@ -57,7 +59,32 @@ const KIND_LABELS: Record<string, string> = {
   reminder: 'Reminder',
   prompt: 'Prompt',
   journal: 'Journal prompt',
+  reflective_question: 'Reflective question',
+  ai_follow_up: 'AI follow-up',
+  archive_gap: 'Archive gap',
+  recording_gap: 'Recording gap',
+  recent_entry_follow_up: 'Recent follow-up',
+  life_event: 'Life event',
 };
+
+const CURRENT_LIFE_KIND_COMPACTS: ReadonlySet<string> = new Set(
+  [
+    'reflective_question',
+    'ai_follow_up',
+    'archive_gap',
+    'recording_gap',
+    'recent_entry_follow_up',
+    'life_event',
+  ].map((key) => key.replace(/[\s_-]+/g, '')),
+);
+
+function compactKind(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+export function isCurrentLifeKind(kind: string): boolean {
+  return CURRENT_LIFE_KIND_COMPACTS.has(compactKind(kind));
+}
 
 export function normalizeEndpoint(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, '');
@@ -94,11 +121,23 @@ export function kindLabelFor(kind: string): string {
   for (const [key, label] of Object.entries(KIND_LABELS)) {
     if (key.replace(/[\s_-]+/g, '') === compact) return label;
   }
-  return 'Conversation starter';
+  return CONVERSATION_STARTER_LABEL;
 }
 
 export function buildPromptText(kind: string, promptText: string): string {
   return `${kindLabelFor(kind)}\n\n${promptText}`;
+}
+
+export function buildPromptParts(kind: string, promptText: string): string[] {
+  if (!isCurrentLifeKind(kind)) {
+    return splitTelegramParts(buildPromptText(kind, promptText));
+  }
+  const baseParts = splitTelegramParts(
+    `${CONVERSATION_STARTER_LABEL}\n\n${promptText}`,
+  );
+  const label = kindLabelFor(kind);
+  const first = label + baseParts[0].slice(CONVERSATION_STARTER_LABEL.length);
+  return [first, ...baseParts.slice(1)];
 }
 
 export function splitTelegramParts(fullText: string): string[] {
@@ -150,12 +189,26 @@ function deliveryItemFromRecord(
   const rawId =
     value['promptInstanceId'] ?? value['prompt_instance_id'] ?? value['id'];
   const rawKind = value['kind'];
-  const rawText =
+  const rawCanonicalText = value['prompt'];
+  const rawLegacyText =
     value['promptText'] ?? value['prompt_text'] ?? value['text'];
+  let rawText: unknown;
+  let isCanonical = false;
+  if (typeof rawCanonicalText === 'string' && rawCanonicalText.length > 0) {
+    rawText = rawCanonicalText;
+    isCanonical = true;
+  } else {
+    rawText = rawLegacyText;
+  }
   if (typeof rawId !== 'string' || rawId.length === 0) return undefined;
   if (typeof rawText !== 'string' || rawText.length === 0) return undefined;
-  if (typeof rawKind !== 'string' || rawKind.length === 0) return undefined;
-  return { promptInstanceId: rawId, kind: rawKind, promptText: rawText };
+  if (typeof rawKind === 'string' && rawKind.length > 0) {
+    return { promptInstanceId: rawId, kind: rawKind, promptText: rawText };
+  }
+  if (rawKind === null && isCanonical) {
+    return { promptInstanceId: rawId, kind: '', promptText: rawText };
+  }
+  return undefined;
 }
 
 export function parseOutboxEnvelope(
@@ -356,8 +409,7 @@ export class LifePromptDeliveryConsumer {
     scope: LifePromptDeliveryScope,
     item: LifePromptDeliveryItem,
   ): Promise<number[] | null> {
-    const fullText = buildPromptText(item.kind, item.promptText);
-    const parts = splitTelegramParts(fullText);
+    const parts = buildPromptParts(item.kind, item.promptText);
     const existing = getLifePromptDeliveryReceipts(
       scope,
       item.promptInstanceId,

@@ -21,7 +21,9 @@ Each tick reads the canonical outbox:
 
 with bearer authorization, and validates the `success` / `data.deliveries` envelope. Empty, rejected, or malformed reads send nothing. Life remains the sole prompt issuance and eligibility owner.
 
-Eligible items carry `promptInstanceId`, `kind`, and the retained `promptText`. The consumer sends a plain-text kind label followed by the exact retained prompt (`<label>\n\n<promptText>`). Known kinds map to owner-facing labels; unknown historical kinds use `Conversation starter`. Messages are split deterministically within Telegram's 4096-character limit.
+Eligible items carry `promptInstanceId` (or `prompt_instance_id` / `id`), `kind`, and the retained canonical `prompt` (`promptText` / `prompt_text` / `text` remain accepted as legacy spellings). The consumer sends a plain-text kind label followed by the exact retained prompt (`<label>\n\n<prompt>`). Current Life kinds map to distinct owner-facing labels: `reflective_question` to `Reflective question`, `ai_follow_up` to `AI follow-up`, `archive_gap` to `Archive gap`, `recording_gap` to `Recording gap`, `recent_entry_follow_up` to `Recent follow-up`, and `life_event` to `Life event`. Known legacy kinds keep their existing labels; an explicit canonical `kind: null` and any unrecognized string use `Conversation starter`. Malformed envelopes (missing identity, missing prompt text, or missing/invalid kind outside the canonical null case) send nothing. Messages are split deterministically within Telegram's 4096-character limit.
+
+For the six current kinds, the consumer splits the former `Conversation starter` rendering first and then substitutes the shorter kind label in the first part. Body segments keep their original indices and the part count is unchanged, so existing receipts stay valid and previously confirmed Telegram messages keep their original headers.
 
 Before each unsent prompt, and before each remaining multipart part, the consumer rechecks current outbox eligibility. When an instance disappears, unsent work pauses and no acknowledgment is sent for it.
 

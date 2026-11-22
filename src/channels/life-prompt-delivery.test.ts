@@ -8,8 +8,11 @@ import {
   type LifePromptDeliveryScope,
 } from '../db/life-prompt-deliveries.js';
 import {
+  buildPromptParts,
+  buildPromptText,
   buildSourceMessageKey,
   ceoDestinationNumeric,
+  credentialFingerprint,
   kindLabelFor,
   LifePromptDeliveryConsumer,
   resolveCeoDestination,
@@ -642,5 +645,225 @@ describe('life-prompt-delivery', () => {
     const text = loggedText();
     expect(text).not.toContain(SECRET_TOKEN);
     expect(text).not.toContain(SECRET_TEXT);
+  });
+
+  it('sends canonical Life prompts with distinct kind labels and preserves compatibility', async () => {
+    const cases: Array<{ kind: string; label: string }> = [
+      { kind: 'reflective_question', label: 'Reflective question' },
+      { kind: 'ai_follow_up', label: 'AI follow-up' },
+      { kind: 'archive_gap', label: 'Archive gap' },
+      { kind: 'recording_gap', label: 'Recording gap' },
+      { kind: 'recent_entry_follow_up', label: 'Recent follow-up' },
+      { kind: 'life_event', label: 'Life event' },
+    ];
+    for (const { kind, label } of cases) {
+      _initTestDatabase();
+      const question = `canonical-question-for-${kind}`;
+      const bot = makeBot();
+      const ackBodies: string[] = [];
+      const useLegacyId = kind === 'life_event';
+      const outboxRecord: Record<string, unknown> = useLegacyId
+        ? { id: `p-${kind}`, prompt: question, kind }
+        : { promptInstanceId: `p-${kind}`, prompt: question, kind };
+      const { fetchImpl } = makeFetch((url, init) => {
+        if (url.includes('/telegram-outbox')) {
+          return jsonResponse({ success: true, data: { deliveries: [outboxRecord] } }, 200);
+        }
+        ackBodies.push(String(init?.body));
+        return jsonResponse({ success: true, data: { promptInstanceId: `p-${kind}` } }, 200);
+      });
+      const consumer = new LifePromptDeliveryConsumer({
+        configProvider: () => config(),
+        groupsProvider: () => groupsFor('111'),
+        botProvider: () => bot.adapter,
+        fetchImpl,
+      });
+      await runOnce(consumer);
+      expect(bot.sent).toHaveLength(1);
+      expect(bot.sent[0].text).toBe(`${label}\n\n${question}`);
+      expect(ackBodies).toHaveLength(1);
+    }
+
+    _initTestDatabase();
+    {
+      const bot = makeBot();
+      const { fetchImpl } = makeFetch((url) => {
+        if (url.includes('/telegram-outbox')) {
+          return jsonResponse(
+            {
+              success: true,
+              data: {
+                deliveries: [
+                  { promptInstanceId: 'p-sched', prompt: 'scheduled-q', kind: 'reflective_question' },
+                  { id: 'p-event', prompt: 'event-q', kind: 'life_event' },
+                ],
+              },
+            },
+            200,
+          );
+        }
+        return jsonResponse({ success: true, data: { promptInstanceId: 'p-sched' } }, 200);
+      });
+      const consumer = new LifePromptDeliveryConsumer({
+        configProvider: () => config(),
+        groupsProvider: () => groupsFor('111'),
+        botProvider: () => bot.adapter,
+        fetchImpl,
+      });
+      await runOnce(consumer);
+      expect(bot.sent).toHaveLength(2);
+      expect(bot.sent[0].text).toBe('Reflective question\n\nscheduled-q');
+      expect(bot.sent[1].text).toBe('Life event\n\nevent-q');
+    }
+
+    for (const kindValue of [null, 'some-future-kind'] as const) {
+      _initTestDatabase();
+      const bot = makeBot();
+      const { fetchImpl } = makeFetch((url) => {
+        if (url.includes('/telegram-outbox')) {
+          return jsonResponse(
+            { success: true, data: { deliveries: [{ promptInstanceId: 'p-h', prompt: 'hq', kind: kindValue }] } },
+            200,
+          );
+        }
+        return jsonResponse({ success: true, data: { promptInstanceId: 'p-h' } }, 200);
+      });
+      const consumer = new LifePromptDeliveryConsumer({
+        configProvider: () => config(),
+        groupsProvider: () => groupsFor('111'),
+        botProvider: () => bot.adapter,
+        fetchImpl,
+      });
+      await runOnce(consumer);
+      expect(bot.sent).toHaveLength(1);
+      expect(bot.sent[0].text).toBe(`Conversation starter\n\nhq`);
+    }
+
+    const legacyShapes: Array<Record<string, unknown>> = [
+      { promptInstanceId: 'p-l1', kind: 'morning', promptText: 'legacy-1' },
+      { prompt_instance_id: 'p-l2', kind: 'evening', prompt_text: 'legacy-2' },
+      { id: 'p-l3', kind: 'nudge', text: 'legacy-3' },
+    ];
+    for (const record of legacyShapes) {
+      _initTestDatabase();
+      const bot = makeBot();
+      const { fetchImpl } = makeFetch((url) => {
+        if (url.includes('/telegram-outbox')) {
+          return jsonResponse({ success: true, data: { deliveries: [record] } }, 200);
+        }
+        const id = String(record['promptInstanceId'] ?? record['prompt_instance_id'] ?? record['id']);
+        return jsonResponse({ success: true, data: { promptInstanceId: id } }, 200);
+      });
+      const consumer = new LifePromptDeliveryConsumer({
+        configProvider: () => config(),
+        groupsProvider: () => groupsFor('111'),
+        botProvider: () => bot.adapter,
+        fetchImpl,
+      });
+      await runOnce(consumer);
+      expect(bot.sent).toHaveLength(1);
+    }
+
+    const malformed: unknown[] = [
+      { success: true, data: { deliveries: [{ prompt: 'q', kind: 'reflective_question' }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: 'p-m', kind: 'reflective_question' }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: 'p-m', prompt: '', kind: 'reflective_question' }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: 'p-m', prompt: 'q' }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: 'p-m', prompt: 'q', kind: '' }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: 'p-m', prompt: 'q', kind: 123 }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: 'p-m', promptText: 'q' }] } },
+      { success: true, data: { deliveries: [{ promptInstanceId: '', prompt: 'q', kind: 'reflective_question' }] } },
+    ];
+    for (const body of malformed) {
+      _initTestDatabase();
+      const bot = makeBot();
+      const { fetchImpl } = makeFetch((url) => {
+        if (url.includes('/telegram-outbox')) return jsonResponse(body, 200);
+        return jsonResponse({ success: true, data: {} }, 200);
+      });
+      const consumer = new LifePromptDeliveryConsumer({
+        configProvider: () => config(),
+        groupsProvider: () => groupsFor('111'),
+        botProvider: () => bot.adapter,
+        fetchImpl,
+      });
+      await runOnce(consumer);
+      expect(bot.sent).toHaveLength(0);
+    }
+  });
+
+  it('preserves Life prompt part boundaries and resumes a retained first-part receipt', async () => {
+    const kinds: Array<{ kind: string; label: string }> = [
+      { kind: 'reflective_question', label: 'Reflective question' },
+      { kind: 'ai_follow_up', label: 'AI follow-up' },
+      { kind: 'archive_gap', label: 'Archive gap' },
+      { kind: 'recording_gap', label: 'Recording gap' },
+      { kind: 'recent_entry_follow_up', label: 'Recent follow-up' },
+      { kind: 'life_event', label: 'Life event' },
+    ];
+    const baseHeader = 'Conversation starter\n\n';
+    for (const { kind, label } of kinds) {
+      for (const promptLen of [TELEGRAM_PROMPT_MAX_LENGTH - baseHeader.length, TELEGRAM_PROMPT_MAX_LENGTH - baseHeader.length + 1]) {
+        const promptText = 'q'.repeat(promptLen);
+        const former = splitTelegramParts(`${baseHeader}${promptText}`);
+        const actual = buildPromptParts(kind, promptText);
+        expect(actual).toHaveLength(former.length);
+        for (const part of actual) {
+          expect(part.length).toBeLessThanOrEqual(TELEGRAM_PROMPT_MAX_LENGTH);
+        }
+        expect(actual.slice(1)).toEqual(former.slice(1));
+        const expectedFirstBody = former[0].slice(baseHeader.length);
+        expect(actual[0]).toBe(`${label}\n\n${expectedFirstBody}`);
+        expect(buildPromptText(kind, promptText)).toBe(`${label}\n\n${promptText}`);
+      }
+    }
+
+    _initTestDatabase();
+    const promptText = 'r'.repeat(TELEGRAM_PROMPT_MAX_LENGTH);
+    const kind = 'reflective_question';
+    const expectedParts = buildPromptParts(kind, promptText);
+    expect(expectedParts).toHaveLength(2);
+    const scope: LifePromptDeliveryScope = {
+      endpoint: BASE_URL,
+      journalId: JOURNAL_ID,
+      credentialFingerprint: credentialFingerprint(SECRET_TOKEN),
+      destination: 'tg:111',
+    };
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'p-resume',
+      partIndex: 0,
+      partCount: expectedParts.length,
+      telegramMessageId: 777,
+      sourceMessageKey: 'telegram:111:777',
+    });
+    const bot = makeBot();
+    const ackBodies: string[] = [];
+    const { fetchImpl } = makeFetch((url, init) => {
+      if (url.includes('/telegram-outbox')) {
+        return jsonResponse(
+          { success: true, data: { deliveries: [{ promptInstanceId: 'p-resume', prompt: promptText, kind }] } },
+          200,
+        );
+      }
+      ackBodies.push(String(init?.body));
+      return jsonResponse({ success: true, data: { promptInstanceId: 'p-resume' } }, 200);
+    });
+    const consumer = new LifePromptDeliveryConsumer({
+      configProvider: () => config(),
+      groupsProvider: () => groupsFor('111'),
+      botProvider: () => bot.adapter,
+      fetchImpl,
+    });
+    await runOnce(consumer);
+    expect(bot.sent).toHaveLength(1);
+    expect(bot.sent[0].text).toBe(expectedParts[1]);
+    expect(ackBodies).toHaveLength(1);
+    const ackBody = JSON.parse(ackBodies[0]) as Record<string, unknown>;
+    expect(String(ackBody['sourceMessageKey'])).toContain('777');
+    expect(String(ackBody['sourceMessageKey']).length).toBeLessThanOrEqual(256);
+    const receipts = getLifePromptDeliveryReceipts(scope, 'p-resume');
+    expect(receipts).toHaveLength(2);
+    expect(isLifePromptDeliveryAcknowledged(scope, 'p-resume')).toBe(true);
   });
 });
