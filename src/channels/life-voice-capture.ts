@@ -20,6 +20,7 @@ export interface ForwardVoiceCaptureInput {
   promptInstanceId?: string;
   durationSeconds?: number;
   onProcessDispatch?: () => void;
+  retryReceiptOnFetchFailure?: boolean;
 }
 
 export type ForwardVoiceCaptureOutcome =
@@ -146,36 +147,53 @@ export async function forwardVoiceCapture(
   const authHeader = `Bearer ${config.token}`;
 
   try {
-    const form = new FormData();
-    form.append(
-      'audio',
-      toAudioBlob(audio, mimeType),
-      `voice${extensionForMime(mimeType)}`,
-    );
-    form.append('sourceMessageKey', sourceMessageKey);
-    if (typeof promptInstanceId === 'string' && promptInstanceId.length > 0) {
-      form.append('promptInstanceId', promptInstanceId);
-    }
-    if (
-      typeof durationSeconds === 'number' &&
-      Number.isFinite(durationSeconds)
-    ) {
-      form.append('durationSeconds', String(durationSeconds));
-    }
+    const buildReceiptForm = (): FormData => {
+      const form = new FormData();
+      form.append(
+        'audio',
+        toAudioBlob(audio, mimeType),
+        `voice${extensionForMime(mimeType)}`,
+      );
+      form.append('sourceMessageKey', sourceMessageKey);
+      if (typeof promptInstanceId === 'string' && promptInstanceId.length > 0) {
+        form.append('promptInstanceId', promptInstanceId);
+      }
+      if (
+        typeof durationSeconds === 'number' &&
+        Number.isFinite(durationSeconds)
+      ) {
+        form.append('durationSeconds', String(durationSeconds));
+      }
+      return form;
+    };
+
+    const postReceipt = (): Promise<Response> =>
+      fetchImpl(receiptUrl, {
+        method: 'POST',
+        headers: { Authorization: authHeader },
+        body: buildReceiptForm(),
+      });
 
     let receiptRes: Response;
     try {
-      receiptRes = await fetchImpl(receiptUrl, {
-        method: 'POST',
-        headers: { Authorization: authHeader },
-        body: form,
-      });
+      receiptRes = await postReceipt();
     } catch {
-      logger.error(
-        { sourceMessageKey, code: 'fetch_failed' },
-        'Life voice receipt request failed',
-      );
-      return { outcome: 'failed', code: 'fetch_failed' };
+      if (input.retryReceiptOnFetchFailure !== true) {
+        logger.error(
+          { sourceMessageKey, code: 'fetch_failed' },
+          'Life voice receipt request failed',
+        );
+        return { outcome: 'failed', code: 'fetch_failed' };
+      }
+      try {
+        receiptRes = await postReceipt();
+      } catch {
+        logger.error(
+          { sourceMessageKey, code: 'fetch_failed' },
+          'Life voice receipt request failed',
+        );
+        return { outcome: 'failed', code: 'fetch_failed' };
+      }
     }
 
     const receiptBody = await readJsonBody(receiptRes);

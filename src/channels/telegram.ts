@@ -1309,7 +1309,12 @@ export class TelegramChannel implements Channel {
         mimeType,
         sourceMessageKey,
         durationSeconds,
-        ...(statusEligible ? { onProcessDispatch: requestStatus } : {}),
+        ...(statusEligible
+          ? {
+              onProcessDispatch: requestStatus,
+              retryReceiptOnFetchFailure: true,
+            }
+          : {}),
       });
       if (result.outcome === 'failed') {
         logger.warn(

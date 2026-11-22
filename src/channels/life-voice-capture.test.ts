@@ -814,4 +814,232 @@ describe('forwardVoiceCapture', () => {
     }
     expectNoSecrets();
   });
+
+  it('retries the receipt once after a fetch rejection and completes a new capture', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) throw new Error('network down');
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      durationSeconds: 12,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'completed', captureId: CAP_NEW });
+    expect(calls).toHaveLength(4);
+    expect(calls[0].url).toBe(receiptUrl());
+    expect(calls[1].url).toBe(receiptUrl());
+    expect(calls[2].url.endsWith('/process')).toBe(true);
+    expect(calls[3].url.endsWith('/complete')).toBe(true);
+    for (const call of calls.slice(0, 2)) {
+      const headers = call.init?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${SECRET_TOKEN}`);
+      const body = call.init?.body as FormData;
+      expect(body.get('sourceMessageKey')).toBe(SOURCE_KEY);
+      expect(body.get('durationSeconds')).toBe('12');
+      expect(await (body.get('audio') as Blob).text()).toBe(AUDIO_TEXT);
+    }
+    expectNoSecrets();
+  });
+
+  it('retries the receipt once and completes a replayed capture', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) throw new Error('network down');
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_REPLAY, state: 'unfinished', replayed: true },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_REPLAY, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_REPLAY, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      promptInstanceId: 'prompt-voice-1',
+      durationSeconds: 7,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'completed', captureId: CAP_REPLAY });
+    expect(calls).toHaveLength(4);
+    expect(calls[0].url).toBe(receiptUrl());
+    expect(calls[1].url).toBe(receiptUrl());
+    for (const call of calls.slice(0, 2)) {
+      const body = call.init?.body as FormData;
+      expect(body.get('sourceMessageKey')).toBe(SOURCE_KEY);
+      expect(body.get('promptInstanceId')).toBe('prompt-voice-1');
+      expect(body.get('durationSeconds')).toBe('7');
+      expect(await (body.get('audio') as Blob).text()).toBe(AUDIO_TEXT);
+      const headers = call.init?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${SECRET_TOKEN}`);
+    }
+    expectNoSecrets();
+  });
+
+  it('retries the receipt once and holds review without completing', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) throw new Error('network down');
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_RESOLVE, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_RESOLVE, state: 'review_ready', nextAction: 'resolve' },
+          },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({
+      outcome: 'review_in_life',
+      captureId: CAP_RESOLVE,
+      needsOwnerReview: true,
+    });
+    expect(calls).toHaveLength(3);
+    expect(calls[0].url).toBe(receiptUrl());
+    expect(calls[1].url).toBe(receiptUrl());
+    expect(calls[2].url.endsWith('/process')).toBe(true);
+    expect(calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+    expectNoSecrets();
+  });
+
+  it('ends forwarding when the retried receipt fetch also rejects', async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) throw new Error('network down');
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'failed', code: 'fetch_failed' });
+    expect(calls).toHaveLength(2);
+    expect(calls[0].url).toBe(receiptUrl());
+    expect(calls[1].url).toBe(receiptUrl());
+    expectNoSecrets();
+  });
+
+  it('does not retry an HTTP error receipt response', async () => {
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        return jsonResponse({ success: false, code: 'invalid_audio' }, 422);
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'failed', code: 'invalid_audio' });
+    expect(calls).toHaveLength(1);
+    expectNoSecrets();
+  });
+
+  it('retains a single receipt attempt without opt-in', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        throw new Error('network down');
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+    });
+
+    expect(result).toEqual({ outcome: 'failed', code: 'fetch_failed' });
+    expect(receiptAttempts).toBe(1);
+    expect(calls).toHaveLength(1);
+    expectNoSecrets();
+  });
 });
