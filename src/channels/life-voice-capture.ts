@@ -127,6 +127,58 @@ function nextActionFromData(data: Record<string, unknown>): string {
   return typeof nextAction === 'string' ? nextAction : '';
 }
 
+function extractReceiptFailureCode(
+  body: Record<string, unknown>,
+): string | undefined {
+  const data = body['data'];
+  const sources: Record<string, unknown>[] = [body];
+  if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+    sources.push(data as Record<string, unknown>);
+  }
+  for (const source of sources) {
+    const code = source['code'];
+    if (typeof code === 'string' && code.length > 0) return code;
+    const nestedError = source['error'];
+    if (typeof nestedError === 'string' && nestedError.length > 0)
+      return nestedError;
+    if (
+      nestedError !== null &&
+      typeof nestedError === 'object' &&
+      !Array.isArray(nestedError)
+    ) {
+      const nestedCode = (nestedError as Record<string, unknown>)['code'];
+      if (typeof nestedCode === 'string' && nestedCode.length > 0)
+        return nestedCode;
+    }
+  }
+  return undefined;
+}
+
+function extractReceiptNextAction(
+  body: Record<string, unknown>,
+): string | undefined {
+  const top = body['nextAction'];
+  if (typeof top === 'string' && top.length > 0) return top;
+  const data = body['data'];
+  if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+    const nested = (data as Record<string, unknown>)['nextAction'];
+    if (typeof nested === 'string' && nested.length > 0) return nested;
+  }
+  return undefined;
+}
+
+function isReceiptRedeliveryRequest(
+  status: number,
+  body: Record<string, unknown>,
+): boolean {
+  if (body['success'] !== false) return false;
+  if (extractReceiptNextAction(body) !== 'redeliver') return false;
+  const code = extractReceiptFailureCode(body);
+  if (status === 502 && code === 'AUDIO_NOT_RETAINED') return true;
+  if (status === 503 && code === 'RECEIPT_NOT_PERSISTED') return true;
+  return false;
+}
+
 function codeFromData(data: Record<string, unknown>): string | undefined {
   const code = data['code'];
   if (typeof code === 'string' && code.length > 0) return code;
@@ -174,9 +226,12 @@ export async function forwardVoiceCapture(
         body: buildReceiptForm(),
       });
 
-    let receiptRes: Response;
+    let receiptRes: Response | undefined;
+    let receiptBody: Record<string, unknown> | undefined;
+    let receiptRetryUsed = false;
     try {
       receiptRes = await postReceipt();
+      receiptBody = await readJsonBody(receiptRes);
     } catch {
       if (input.retryReceiptOnFetchFailure !== true) {
         logger.error(
@@ -187,6 +242,8 @@ export async function forwardVoiceCapture(
       }
       try {
         receiptRes = await postReceipt();
+        receiptBody = await readJsonBody(receiptRes);
+        receiptRetryUsed = true;
       } catch {
         logger.error(
           { sourceMessageKey, code: 'fetch_failed' },
@@ -196,7 +253,32 @@ export async function forwardVoiceCapture(
       }
     }
 
-    const receiptBody = await readJsonBody(receiptRes);
+    if (
+      !receiptRetryUsed &&
+      input.retryReceiptOnFetchFailure === true &&
+      receiptRes !== undefined &&
+      receiptBody !== undefined &&
+      isReceiptRedeliveryRequest(receiptRes.status, receiptBody)
+    ) {
+      try {
+        receiptRes = await postReceipt();
+        receiptBody = await readJsonBody(receiptRes);
+      } catch {
+        logger.error(
+          { sourceMessageKey, code: 'fetch_failed' },
+          'Life voice receipt request failed',
+        );
+        return { outcome: 'failed', code: 'fetch_failed' };
+      }
+    }
+
+    if (receiptRes === undefined || receiptBody === undefined) {
+      logger.error(
+        { sourceMessageKey, code: 'fetch_failed' },
+        'Life voice receipt request failed',
+      );
+      return { outcome: 'failed', code: 'fetch_failed' };
+    }
     if (!receiptRes.ok || receiptBody['success'] !== true) {
       const code = errorCodeFromBody(receiptBody, receiptRes.status);
       logger.warn(

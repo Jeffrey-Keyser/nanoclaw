@@ -1042,4 +1042,337 @@ describe('forwardVoiceCapture', () => {
     expect(calls).toHaveLength(1);
     expectNoSecrets();
   });
+
+  it('retries a 502 AUDIO_NOT_RETAINED redelivery once with identical receipt identity', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) {
+          return jsonResponse(
+            {
+              success: false,
+              code: 'AUDIO_NOT_RETAINED',
+              nextAction: 'redeliver',
+            },
+            502,
+          );
+        }
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      durationSeconds: 12,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'completed', captureId: CAP_NEW });
+    expect(calls).toHaveLength(4);
+    expect(calls[0].url).toBe(receiptUrl());
+    expect(calls[1].url).toBe(receiptUrl());
+    for (const call of calls.slice(0, 2)) {
+      const headers = call.init?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${SECRET_TOKEN}`);
+      const body = call.init?.body as FormData;
+      expect(body.get('sourceMessageKey')).toBe(SOURCE_KEY);
+      expect(body.get('durationSeconds')).toBe('12');
+      expect(await (body.get('audio') as Blob).text()).toBe(AUDIO_TEXT);
+    }
+    expectNoSecrets();
+  });
+
+  it('retries a 503 RECEIPT_NOT_PERSISTED redelivery once and completes a replayed capture', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) {
+          return jsonResponse(
+            {
+              success: false,
+              data: { code: 'RECEIPT_NOT_PERSISTED', nextAction: 'redeliver' },
+            },
+            503,
+          );
+        }
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_REPLAY, state: 'unfinished', replayed: true },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_REPLAY, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_REPLAY, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      promptInstanceId: 'prompt-voice-1',
+      durationSeconds: 7,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'completed', captureId: CAP_REPLAY });
+    expect(calls).toHaveLength(4);
+    expect(calls[0].url).toBe(receiptUrl());
+    expect(calls[1].url).toBe(receiptUrl());
+    for (const call of calls.slice(0, 2)) {
+      const headers = call.init?.headers as Record<string, string>;
+      expect(headers['Authorization']).toBe(`Bearer ${SECRET_TOKEN}`);
+      const body = call.init?.body as FormData;
+      expect(body.get('sourceMessageKey')).toBe(SOURCE_KEY);
+      expect(body.get('promptInstanceId')).toBe('prompt-voice-1');
+      expect(body.get('durationSeconds')).toBe('7');
+      expect(await (body.get('audio') as Blob).text()).toBe(AUDIO_TEXT);
+    }
+    expectNoSecrets();
+  });
+
+  it('holds review without completing after a redelivered receipt', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) {
+          return jsonResponse(
+            {
+              success: false,
+              code: 'AUDIO_NOT_RETAINED',
+              nextAction: 'redeliver',
+            },
+            502,
+          );
+        }
+        return jsonResponse(
+          { success: true, data: { captureId: CAP_RESOLVE, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_RESOLVE, state: 'review_ready', nextAction: 'resolve' },
+          },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({
+      outcome: 'review_in_life',
+      captureId: CAP_RESOLVE,
+      needsOwnerReview: true,
+    });
+    expect(calls).toHaveLength(3);
+    expect(calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+    expectNoSecrets();
+  });
+
+  it('returns completed without further mutation for an already completed replay after redelivery', async () => {
+    let receiptAttempts = 0;
+    const { fetchImpl, calls } = recordingFetch((url) => {
+      if (url === receiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) {
+          return jsonResponse(
+            {
+              success: false,
+              code: 'RECEIPT_NOT_PERSISTED',
+              nextAction: 'redeliver',
+            },
+            503,
+          );
+        }
+        return jsonResponse(
+          {
+            success: true,
+            data: { captureId: CAP_DONE, state: 'completed', replayed: true },
+          },
+          200,
+        );
+      }
+      throw new Error(`unexpected url ${url}`);
+    });
+
+    const result = await forwardVoiceCapture({
+      fetchImpl,
+      config: config(),
+      audio: audioBytes(),
+      mimeType: 'audio/ogg',
+      sourceMessageKey: SOURCE_KEY,
+      retryReceiptOnFetchFailure: true,
+    });
+
+    expect(result).toEqual({ outcome: 'completed', captureId: CAP_DONE });
+    expect(calls).toHaveLength(2);
+    expect(calls.every((c) => c.url === receiptUrl())).toBe(true);
+    expectNoSecrets();
+  });
+
+  it('enforces one owner receipt retry across transport and explicit redelivery failures', async () => {
+    async function runReceiptSequence(
+      responses: Array<{ kind: 'throw' } | { kind: 'response'; body: unknown; status: number }>,
+      withOptIn: boolean,
+    ): Promise<{ result: { outcome: string; code?: string; captureId?: string }; calls: Array<{ url: string; init?: RequestInit }> }> {
+      let index = 0;
+      const { fetchImpl, calls } = recordingFetch((url) => {
+        if (url === receiptUrl()) {
+          const step = responses[Math.min(index, responses.length - 1)];
+          index += 1;
+          if (step.kind === 'throw') throw new Error('network down');
+          return jsonResponse(step.body, step.status);
+        }
+        if (url.endsWith('/process')) {
+          return jsonResponse(
+            {
+              success: true,
+              data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+            },
+            200,
+          );
+        }
+        if (url.endsWith('/complete')) {
+          return jsonResponse(
+            { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+            200,
+          );
+        }
+        throw new Error(`unexpected url ${url}`);
+      });
+      const result = await forwardVoiceCapture({
+        fetchImpl,
+        config: config(),
+        audio: audioBytes(),
+        mimeType: 'audio/ogg',
+        sourceMessageKey: SOURCE_KEY,
+        ...(withOptIn ? { retryReceiptOnFetchFailure: true as const } : {}),
+      });
+      return { result, calls };
+    }
+
+    const redeliver502 = {
+      kind: 'response' as const,
+      body: { success: false, code: 'AUDIO_NOT_RETAINED', nextAction: 'redeliver' },
+      status: 502,
+    };
+    const redeliver503 = {
+      kind: 'response' as const,
+      body: { success: false, code: 'RECEIPT_NOT_PERSISTED', nextAction: 'redeliver' },
+      status: 503,
+    };
+
+    const mixedThrowThenRedeliver = await runReceiptSequence(
+      [{ kind: 'throw' }, redeliver502],
+      true,
+    );
+    expect(mixedThrowThenRedeliver.result.outcome).toBe('failed');
+    expect(mixedThrowThenRedeliver.result.code).toBe('AUDIO_NOT_RETAINED');
+    expect(mixedThrowThenRedeliver.calls).toHaveLength(2);
+    expect(mixedThrowThenRedeliver.calls.every((c) => c.url === receiptUrl())).toBe(true);
+
+    const mixedRedeliverThenThrow = await runReceiptSequence(
+      [redeliver503, { kind: 'throw' }],
+      true,
+    );
+    expect(mixedRedeliverThenThrow.result).toEqual({
+      outcome: 'failed',
+      code: 'fetch_failed',
+    });
+    expect(mixedRedeliverThenThrow.calls).toHaveLength(2);
+
+    const repeatedExplicit = await runReceiptSequence([redeliver502, redeliver502], true);
+    expect(repeatedExplicit.result.outcome).toBe('failed');
+    expect(repeatedExplicit.result.code).toBe('AUDIO_NOT_RETAINED');
+    expect(repeatedExplicit.calls).toHaveLength(2);
+    expect(repeatedExplicit.calls.every((c) => c.url === receiptUrl())).toBe(true);
+
+    for (const unrelated of [
+      { body: { success: false, code: 'invalid_audio' }, status: 422 },
+      { body: { success: false, code: 'AUDIO_NOT_RETAINED', nextAction: 'redeliver' }, status: 500 },
+      { body: { success: false, code: 'OTHER_CODE', nextAction: 'redeliver' }, status: 502 },
+      { body: { success: false, code: 'AUDIO_NOT_RETAINED', nextAction: 'wait' }, status: 502 },
+      { body: { success: false, code: 'AUDIO_NOT_RETAINED' }, status: 502 },
+      { body: { success: false }, status: 502 },
+      { body: { ok: true }, status: 502 },
+    ]) {
+      const outcome = await runReceiptSequence(
+        [{ kind: 'response', body: unrelated.body, status: unrelated.status }],
+        true,
+      );
+      expect(outcome.result.outcome).toBe('failed');
+      expect(outcome.calls).toHaveLength(1);
+      expect(outcome.calls[0].url).toBe(receiptUrl());
+    }
+
+    const withoutOptIn = await runReceiptSequence([redeliver502], false);
+    expect(withoutOptIn.result.outcome).toBe('failed');
+    expect(withoutOptIn.calls).toHaveLength(1);
+
+    const withoutOptInThrow = await runReceiptSequence([{ kind: 'throw' }], false);
+    expect(withoutOptInThrow.result).toEqual({ outcome: 'failed', code: 'fetch_failed' });
+    expect(withoutOptInThrow.calls).toHaveLength(1);
+
+    const terminal = await runReceiptSequence([redeliver502, redeliver503], true);
+    expect(terminal.result.outcome).toBe('failed');
+    expect(terminal.calls).toHaveLength(2);
+    expect(terminal.calls.some((c) => c.url.endsWith('/process'))).toBe(false);
+    expect(terminal.calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+    expectNoSecrets();
+  });
 });
