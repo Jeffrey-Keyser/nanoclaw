@@ -2512,6 +2512,384 @@ describe('TelegramChannel', () => {
       fetchSpy.mockRestore();
       clearLifeEnv();
     });
+
+    it('applies the completion retry only to ordinary owner notes and preserves truthful Telegram outcomes', async () => {
+      const {
+        LIFE_VOICE_PROCESSING_STATUS,
+        LIFE_VOICE_SAVED_STATUS,
+        LIFE_VOICE_UNCONFIRMED_STATUS,
+        LIFE_VOICE_REVIEW_INSTRUCTION,
+      } = await import('./telegram.js');
+      const actual =
+        await vi.importActual<typeof import('./life-voice-capture.js')>(
+          './life-voice-capture.js',
+        );
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+
+      type CompleteStep =
+        | { kind: 'throw' }
+        | { kind: 'response'; body: unknown; status: number };
+
+      async function runVoiceScenario(args: {
+        captureId: string;
+        audioText: string;
+        completeSteps: CompleteStep[];
+        processBody?: unknown;
+        ctxOverrides?: Record<string, unknown>;
+        groups?: Record<string, unknown>;
+      }): Promise<{
+        lifeCalls: Array<{ url: string; init?: RequestInit }>;
+        telegramCalls: string[];
+        ctx: any;
+        opts: TelegramChannelOpts;
+        receiptUrl: string;
+      }> {
+        setVoiceLifeEnv();
+        vi.mocked(forwardVoiceCapture).mockClear();
+        vi.mocked(forwardVoiceCapture).mockImplementationOnce(
+          actual.forwardVoiceCapture,
+        );
+        const receiptUrl =
+          'https://life.example.com/api/v1/journals/42/voice/captures';
+        const lifeCalls: Array<{ url: string; init?: RequestInit }> = [];
+        const telegramCalls: string[] = [];
+        let completeIndex = 0;
+        const fetchSpy = vi
+          .spyOn(globalThis, 'fetch')
+          .mockImplementation(async (input: any, init?: any) => {
+            const url = String(input);
+            if (url.includes('api.telegram.org')) {
+              telegramCalls.push(url);
+              return {
+                ok: true,
+                status: 200,
+                arrayBuffer: async () =>
+                  new TextEncoder().encode(args.audioText)
+                    .buffer as ArrayBuffer,
+              } as Response;
+            }
+            lifeCalls.push({ url, init });
+            if (url === receiptUrl) {
+              return new Response(
+                JSON.stringify({
+                  success: true,
+                  data: { captureId: args.captureId, state: 'unfinished' },
+                }),
+                {
+                  status: 201,
+                  headers: { 'Content-Type': 'application/json' },
+                },
+              );
+            }
+            if (url === `${receiptUrl}/${args.captureId}/process`) {
+              const body =
+                args.processBody ??
+                ({
+                  success: true,
+                  data: {
+                    captureId: args.captureId,
+                    state: 'unfinished',
+                    nextAction: 'complete',
+                  },
+                } as unknown);
+              return new Response(JSON.stringify(body), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            if (url === `${receiptUrl}/${args.captureId}/complete`) {
+              const step =
+                args.completeSteps[
+                  Math.min(completeIndex, args.completeSteps.length - 1)
+                ];
+              completeIndex += 1;
+              if (step.kind === 'throw') throw new Error('network down');
+              return new Response(JSON.stringify(step.body), {
+                status: step.status,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            throw new Error(`unexpected url ${url}`);
+          });
+
+        const opts = makeOpts();
+        (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue(
+          (args.groups ?? { 'tg:111': { folder: 'ceo' } }) as any,
+        );
+        const ch = new TelegramChannel('token123', opts);
+        await ch.connect();
+        const handler = getVoiceHandler(lastBotInstance);
+        expect(handler).toBeDefined();
+        const ctx = {
+          ...makeVoiceCtx(),
+          chat: { id: 111, type: 'private' },
+          from: { id: 111, first_name: 'Ceo' },
+          api: {
+            getFile: vi
+              .fn()
+              .mockResolvedValue({ file_path: 'voice/file_123.ogg' }),
+            editMessageText: vi.fn().mockResolvedValue(true),
+          },
+          reply: vi.fn().mockResolvedValue({ message_id: 801 }),
+          ...(args.ctxOverrides ?? {}),
+        };
+        await handler(ctx);
+        await ch.disconnect();
+        fetchSpy.mockRestore();
+        clearLifeEnv();
+        return { lifeCalls, telegramCalls, ctx, opts, receiptUrl };
+      }
+
+      function expectSameCompletionPost(
+        lifeCalls: Array<{ url: string; init?: RequestInit }>,
+      ): void {
+        const completes = lifeCalls.filter((c) =>
+          c.url.endsWith('/complete'),
+        );
+        expect(completes).toHaveLength(2);
+        expect(completes[0].url).toBe(completes[1].url);
+        for (const call of completes) {
+          const headers = call.init?.headers as Record<string, string>;
+          expect(headers['Authorization']).toBe('Bearer test-token-abc');
+          expect(headers['Content-Type']).toBe('application/json');
+          expect(call.init?.method).toBe('POST');
+          expect(call.init?.body).toBe(JSON.stringify({}));
+        }
+      }
+
+      const CAP_A = 'c0a11111-1111-4111-8111-111111111111';
+      const retryAfterThrow = await runVoiceScenario({
+        captureId: CAP_A,
+        audioText: 'completion-retry-throw-audio',
+        completeSteps: [
+          { kind: 'throw' },
+          {
+            kind: 'response',
+            body: {
+              success: true,
+              data: { captureId: CAP_A, state: 'completed' },
+            },
+            status: 200,
+          },
+        ],
+      });
+      expect(retryAfterThrow.lifeCalls).toHaveLength(4);
+      expect(retryAfterThrow.lifeCalls[0].url).toBe(
+        retryAfterThrow.receiptUrl,
+      );
+      expect(retryAfterThrow.lifeCalls[1].url).toBe(
+        `${retryAfterThrow.receiptUrl}/${CAP_A}/process`,
+      );
+      expectSameCompletionPost(retryAfterThrow.lifeCalls);
+      expect(retryAfterThrow.telegramCalls).toHaveLength(1);
+      expect(retryAfterThrow.ctx.reply).toHaveBeenCalledWith(
+        LIFE_VOICE_PROCESSING_STATUS,
+      );
+      const editAfterThrow =
+        retryAfterThrow.ctx.api.editMessageText as ReturnType<typeof vi.fn>;
+      expect(editAfterThrow).toHaveBeenCalledTimes(1);
+      expect(editAfterThrow.mock.calls[0][2]).toBe(LIFE_VOICE_SAVED_STATUS);
+      expect(retryAfterThrow.opts.onMessage).toHaveBeenCalledTimes(1);
+
+      const CAP_B = 'c0b22222-2222-4222-8222-222222222222';
+      const retryAfterCanonical = await runVoiceScenario({
+        captureId: CAP_B,
+        audioText: 'completion-retry-503-audio',
+        completeSteps: [
+          {
+            kind: 'response',
+            body: {
+              success: false,
+              error: 'completion failed, retry complete',
+              code: 'COMPLETION_FAILED',
+              nextAction: 'complete',
+            },
+            status: 503,
+          },
+          {
+            kind: 'response',
+            body: {
+              success: true,
+              data: { captureId: CAP_B, state: 'completed', replayed: true },
+            },
+            status: 200,
+          },
+        ],
+      });
+      expect(retryAfterCanonical.lifeCalls).toHaveLength(4);
+      expectSameCompletionPost(retryAfterCanonical.lifeCalls);
+      expect(retryAfterCanonical.telegramCalls).toHaveLength(1);
+      const editAfterCanonical =
+        retryAfterCanonical.ctx.api.editMessageText as ReturnType<typeof vi.fn>;
+      expect(editAfterCanonical).toHaveBeenCalledTimes(1);
+      expect(editAfterCanonical.mock.calls[0][2]).toBe(LIFE_VOICE_SAVED_STATUS);
+
+      const CAP_C = 'c0c33333-3333-4333-8333-333333333333';
+      const exhausted = await runVoiceScenario({
+        captureId: CAP_C,
+        audioText: 'completion-exhausted-audio',
+        completeSteps: [{ kind: 'throw' }, { kind: 'throw' }],
+      });
+      expect(exhausted.lifeCalls).toHaveLength(4);
+      expectSameCompletionPost(exhausted.lifeCalls);
+      expect(exhausted.telegramCalls).toHaveLength(1);
+      const editExhausted =
+        exhausted.ctx.api.editMessageText as ReturnType<typeof vi.fn>;
+      expect(editExhausted).toHaveBeenCalledTimes(1);
+      expect(editExhausted.mock.calls[0][2]).toBe(
+        LIFE_VOICE_UNCONFIRMED_STATUS,
+      );
+      expect(editExhausted.mock.calls[0][2]).not.toBe(LIFE_VOICE_SAVED_STATUS);
+
+      const CAP_D = 'c0d44444-4444-4434-8434-444444444444';
+      const mismatched = await runVoiceScenario({
+        captureId: CAP_D,
+        audioText: 'completion-mismatch-audio',
+        completeSteps: [
+          {
+            kind: 'response',
+            body: {
+              success: true,
+              data: {
+                captureId: 'ffffffff-ffff-4fff-8fff-ffffffffffff',
+                state: 'completed',
+              },
+            },
+            status: 200,
+          },
+        ],
+      });
+      expect(mismatched.lifeCalls).toHaveLength(3);
+      expect(
+        mismatched.lifeCalls.filter((c) => c.url.endsWith('/complete')),
+      ).toHaveLength(1);
+      const editMismatched =
+        mismatched.ctx.api.editMessageText as ReturnType<typeof vi.fn>;
+      expect(editMismatched).toHaveBeenCalledTimes(1);
+      expect(editMismatched.mock.calls[0][2]).toBe(
+        LIFE_VOICE_UNCONFIRMED_STATUS,
+      );
+
+      const CAP_E = 'c0e55555-5555-4535-8535-555555555555';
+      const groupCaller = await runVoiceScenario({
+        captureId: CAP_E,
+        audioText: 'completion-group-single-audio',
+        completeSteps: [
+          { kind: 'throw' },
+          {
+            kind: 'response',
+            body: {
+              success: true,
+              data: { captureId: CAP_E, state: 'completed' },
+            },
+            status: 200,
+          },
+        ],
+        ctxOverrides: { chat: { id: 111, type: 'group' } },
+      });
+      expect(groupCaller.lifeCalls).toHaveLength(3);
+      expect(
+        groupCaller.lifeCalls.filter((c) => c.url.endsWith('/complete')),
+      ).toHaveLength(1);
+      expect(groupCaller.ctx.reply).not.toHaveBeenCalled();
+      expect(
+        groupCaller.ctx.api.editMessageText as ReturnType<typeof vi.fn>,
+      ).not.toHaveBeenCalled();
+
+      const CAP_F = 'c0f66666-6666-4636-8636-666666666666';
+      const reviewHeld = await runVoiceScenario({
+        captureId: CAP_F,
+        audioText: 'completion-review-audio',
+        completeSteps: [
+          {
+            kind: 'response',
+            body: {
+              success: true,
+              data: { captureId: CAP_F, state: 'completed' },
+            },
+            status: 200,
+          },
+        ],
+        processBody: {
+          success: true,
+          data: {
+            captureId: CAP_F,
+            state: 'review_ready',
+            nextAction: 'resolve',
+          },
+        },
+      });
+      expect(reviewHeld.lifeCalls).toHaveLength(2);
+      expect(
+        reviewHeld.lifeCalls.some((c) => c.url.endsWith('/complete')),
+      ).toBe(false);
+      const editReview =
+        reviewHeld.ctx.api.editMessageText as ReturnType<typeof vi.fn>;
+      expect(editReview).toHaveBeenCalledTimes(1);
+      expect(editReview.mock.calls[0][2]).toBe(LIFE_VOICE_REVIEW_INSTRUCTION);
+
+      const CAP_G = 'c0a77777-7777-4737-8737-777777777777';
+      const promptCalls: Array<{ url: string; init?: RequestInit }> = [];
+      const promptFetch = (async (
+        input: string | URL,
+        init?: RequestInit,
+      ): Promise<Response> => {
+        const url = String(input);
+        promptCalls.push({ url, init });
+        if (url.endsWith('/voice/captures')) {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              data: { captureId: CAP_G, state: 'unfinished' },
+            }),
+            {
+              status: 201,
+              headers: { 'Content-Type': 'application/json' },
+            },
+          );
+        }
+        if (url.endsWith('/process')) {
+          return new Response(
+            JSON.stringify({
+              success: true,
+              data: {
+                captureId: CAP_G,
+                state: 'unfinished',
+                nextAction: 'complete',
+              },
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
+          );
+        }
+        if (url.endsWith('/complete')) throw new Error('network down');
+        throw new Error(`unexpected url ${url}`);
+      }) as unknown as (
+        input: string | URL,
+        init?: RequestInit,
+      ) => Promise<Response>;
+      const promptResult = await actual.forwardVoiceCapture({
+        fetchImpl: promptFetch,
+        config: {
+          baseUrl: 'https://life.example.com',
+          journalId: '42',
+          token: 'test-token-abc',
+        },
+        audio: new TextEncoder().encode('prompt-audio-bytes'),
+        mimeType: 'audio/ogg',
+        sourceMessageKey: 'telegram:111:999',
+        promptInstanceId: 'prompt-voice-1',
+      });
+      expect(promptResult.outcome).toBe('failed');
+      expect(promptCalls).toHaveLength(3);
+      expect(
+        promptCalls.filter((c) => c.url.endsWith('/complete')),
+      ).toHaveLength(1);
+    });
   });
 
   describe('/life text capture command', () => {

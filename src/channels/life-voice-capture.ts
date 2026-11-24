@@ -21,6 +21,7 @@ export interface ForwardVoiceCaptureInput {
   durationSeconds?: number;
   onProcessDispatch?: () => void;
   retryReceiptOnFetchFailure?: boolean;
+  retryCompletionOnTransientFailure?: boolean;
 }
 
 export type ForwardVoiceCaptureOutcome =
@@ -177,6 +178,32 @@ function isReceiptRedeliveryRequest(
   if (status === 502 && code === 'AUDIO_NOT_RETAINED') return true;
   if (status === 503 && code === 'RECEIPT_NOT_PERSISTED') return true;
   return false;
+}
+
+function completionField(
+  body: Record<string, unknown>,
+  key: string,
+): unknown {
+  const top = body[key];
+  if (typeof top === 'string' && top.length > 0) return top;
+  const data = body['data'];
+  if (data !== null && typeof data === 'object' && !Array.isArray(data)) {
+    const nested = (data as Record<string, unknown>)[key];
+    if (typeof nested === 'string' && nested.length > 0) return nested;
+  }
+  return undefined;
+}
+
+function isCompletionRetryable(
+  status: number,
+  body: Record<string, unknown>,
+): boolean {
+  if (status !== 503) return false;
+  if (body['success'] !== false) return false;
+  if (completionField(body, 'error') === undefined) return false;
+  if (completionField(body, 'code') !== 'COMPLETION_FAILED') return false;
+  if (completionField(body, 'nextAction') !== 'complete') return false;
+  return true;
 }
 
 function codeFromData(data: Record<string, unknown>): string | undefined {
@@ -455,9 +482,8 @@ export async function forwardVoiceCapture(
     }
 
     const completeUrl = `${receiptUrl}/${encodeURIComponent(captureId)}/complete`;
-    let completeRes: Response;
-    try {
-      completeRes = await fetchImpl(completeUrl, {
+    const postComplete = (): Promise<Response> =>
+      fetchImpl(completeUrl, {
         method: 'POST',
         headers: {
           Authorization: authHeader,
@@ -465,15 +491,60 @@ export async function forwardVoiceCapture(
         },
         body: JSON.stringify({}),
       });
+
+    let completeRes: Response | undefined;
+    let completeBody: Record<string, unknown> | undefined;
+    let completionRetryUsed = false;
+    try {
+      completeRes = await postComplete();
+      completeBody = await readJsonBody(completeRes);
     } catch {
+      if (input.retryCompletionOnTransientFailure !== true) {
+        logger.error(
+          { sourceMessageKey, captureId, code: 'fetch_failed' },
+          'Life voice complete request failed',
+        );
+        return { outcome: 'failed', captureId, code: 'fetch_failed' };
+      }
+      try {
+        completeRes = await postComplete();
+        completeBody = await readJsonBody(completeRes);
+        completionRetryUsed = true;
+      } catch {
+        logger.error(
+          { sourceMessageKey, captureId, code: 'fetch_failed' },
+          'Life voice complete request failed',
+        );
+        return { outcome: 'failed', captureId, code: 'fetch_failed' };
+      }
+    }
+
+    if (
+      !completionRetryUsed &&
+      input.retryCompletionOnTransientFailure === true &&
+      completeRes !== undefined &&
+      completeBody !== undefined &&
+      isCompletionRetryable(completeRes.status, completeBody)
+    ) {
+      try {
+        completeRes = await postComplete();
+        completeBody = await readJsonBody(completeRes);
+      } catch {
+        logger.error(
+          { sourceMessageKey, captureId, code: 'fetch_failed' },
+          'Life voice complete request failed',
+        );
+        return { outcome: 'failed', captureId, code: 'fetch_failed' };
+      }
+    }
+
+    if (completeRes === undefined || completeBody === undefined) {
       logger.error(
         { sourceMessageKey, captureId, code: 'fetch_failed' },
         'Life voice complete request failed',
       );
       return { outcome: 'failed', captureId, code: 'fetch_failed' };
     }
-
-    const completeBody = await readJsonBody(completeRes);
     if (!completeRes.ok || completeBody['success'] !== true) {
       const code = errorCodeFromBody(completeBody, completeRes.status);
       logger.warn(

@@ -1375,4 +1375,305 @@ describe('forwardVoiceCapture', () => {
     expect(terminal.calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
     expectNoSecrets();
   });
+
+  it('retries the same completion after a rejected fetch and accepts a new or replayed save', async () => {
+    for (const replayed of [false, true]) {
+      const captureId = replayed ? CAP_REPLAY : CAP_NEW;
+      let completeAttempts = 0;
+      const { fetchImpl, calls } = recordingFetch((url) => {
+        if (url === receiptUrl()) {
+          return jsonResponse(
+            {
+              success: true,
+              data: {
+                captureId,
+                state: 'unfinished',
+                ...(replayed ? { replayed: true } : {}),
+              },
+            },
+            replayed ? 200 : 201,
+          );
+        }
+        if (url.endsWith('/process')) {
+          return jsonResponse(
+            {
+              success: true,
+              data: { captureId, state: 'unfinished', nextAction: 'complete' },
+            },
+            200,
+          );
+        }
+        if (url.endsWith('/complete')) {
+          completeAttempts += 1;
+          if (completeAttempts === 1) throw new Error('network down');
+          return jsonResponse(
+            {
+              success: true,
+              data: {
+                captureId,
+                state: 'completed',
+                ...(replayed ? { replayed: true } : {}),
+              },
+            },
+            200,
+          );
+        }
+        throw new Error(`unexpected url ${url}`);
+      });
+
+      const result = await forwardVoiceCapture({
+        fetchImpl,
+        config: config(),
+        audio: audioBytes(),
+        mimeType: 'audio/ogg',
+        sourceMessageKey: SOURCE_KEY,
+        retryCompletionOnTransientFailure: true,
+      });
+
+      expect(result).toEqual({ outcome: 'completed', captureId });
+      expect(calls).toHaveLength(4);
+      expect(calls[0].url).toBe(receiptUrl());
+      expect(calls[1].url.endsWith('/process')).toBe(true);
+      expect(calls[2].url.endsWith('/complete')).toBe(true);
+      expect(calls[3].url.endsWith('/complete')).toBe(true);
+      expect(calls[2].url).toBe(calls[3].url);
+      for (const call of calls.slice(2)) {
+        const headers = call.init?.headers as Record<string, string>;
+        expect(headers['Authorization']).toBe(`Bearer ${SECRET_TOKEN}`);
+        expect(headers['Content-Type']).toBe('application/json');
+        expect(call.init?.method).toBe('POST');
+        expect(call.init?.body).toBe(JSON.stringify({}));
+      }
+      expect(calls.filter((c) => c.url === receiptUrl())).toHaveLength(1);
+      expect(calls.filter((c) => c.url.endsWith('/process'))).toHaveLength(1);
+      expect(calls.filter((c) => c.url.endsWith('/complete'))).toHaveLength(2);
+    }
+    expectNoSecrets();
+  });
+
+  it('allows one completion retry for the canonical failure and rejects other retry triggers', async () => {
+    type CompleteStep =
+      | { kind: 'throw' }
+      | { kind: 'response'; body: unknown; status: number };
+
+    async function runCompletionSequence(
+      completeSteps: CompleteStep[],
+      withOptIn: boolean,
+    ): Promise<{
+      result: { outcome: string; code?: string; captureId?: string };
+      calls: Array<{ url: string; init?: RequestInit }>;
+    }> {
+      let index = 0;
+      const { fetchImpl, calls } = recordingFetch((url) => {
+        if (url === receiptUrl()) {
+          return jsonResponse(
+            { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+            201,
+          );
+        }
+        if (url.endsWith('/process')) {
+          return jsonResponse(
+            {
+              success: true,
+              data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+            },
+            200,
+          );
+        }
+        if (url.endsWith('/complete')) {
+          const step = completeSteps[Math.min(index, completeSteps.length - 1)];
+          index += 1;
+          if (step.kind === 'throw') throw new Error('network down');
+          return jsonResponse(step.body, step.status);
+        }
+        throw new Error(`unexpected url ${url}`);
+      });
+      const result = await forwardVoiceCapture({
+        fetchImpl,
+        config: config(),
+        audio: audioBytes(),
+        mimeType: 'audio/ogg',
+        sourceMessageKey: SOURCE_KEY,
+        ...(withOptIn ? { retryCompletionOnTransientFailure: true as const } : {}),
+      });
+      return { result, calls };
+    }
+
+    const canonicalTop = {
+      kind: 'response' as const,
+      body: {
+        success: false,
+        error: 'completion failed, retry complete',
+        code: 'COMPLETION_FAILED',
+        nextAction: 'complete',
+      },
+      status: 503,
+    };
+    const canonicalNested = {
+      kind: 'response' as const,
+      body: {
+        success: false,
+        data: {
+          error: 'completion failed, retry complete',
+          code: 'COMPLETION_FAILED',
+          nextAction: 'complete',
+        },
+      },
+      status: 503,
+    };
+    const completedNew = {
+      kind: 'response' as const,
+      body: { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+      status: 200,
+    };
+
+    for (const canonical of [canonicalTop, canonicalNested]) {
+      const retried = await runCompletionSequence([canonical, completedNew], true);
+      expect(retried.result).toEqual({ outcome: 'completed', captureId: CAP_NEW });
+      expect(retried.calls).toHaveLength(4);
+      expect(retried.calls[0].url).toBe(receiptUrl());
+      expect(retried.calls[1].url.endsWith('/process')).toBe(true);
+      expect(retried.calls[2].url.endsWith('/complete')).toBe(true);
+      expect(retried.calls[3].url.endsWith('/complete')).toBe(true);
+      expect(retried.calls[2].url).toBe(retried.calls[3].url);
+      for (const call of retried.calls.slice(2)) {
+        const headers = call.init?.headers as Record<string, string>;
+        expect(headers['Authorization']).toBe(`Bearer ${SECRET_TOKEN}`);
+        expect(call.init?.body).toBe(JSON.stringify({}));
+      }
+    }
+
+    const throwThenCanonical = await runCompletionSequence(
+      [{ kind: 'throw' }, canonicalTop],
+      true,
+    );
+    expect(throwThenCanonical.result.outcome).toBe('failed');
+    expect(throwThenCanonical.result.code).toBe('COMPLETION_FAILED');
+    expect(throwThenCanonical.calls).toHaveLength(4);
+    expect(
+      throwThenCanonical.calls.filter((c) => c.url.endsWith('/complete')),
+    ).toHaveLength(2);
+
+    const canonicalThenThrow = await runCompletionSequence(
+      [canonicalTop, { kind: 'throw' }],
+      true,
+    );
+    expect(canonicalThenThrow.result).toEqual({
+      outcome: 'failed',
+      captureId: CAP_NEW,
+      code: 'fetch_failed',
+    });
+    expect(canonicalThenThrow.calls).toHaveLength(4);
+
+    const canonicalThenCanonical = await runCompletionSequence(
+      [canonicalTop, canonicalTop],
+      true,
+    );
+    expect(canonicalThenCanonical.result.outcome).toBe('failed');
+    expect(canonicalThenCanonical.result.code).toBe('COMPLETION_FAILED');
+    expect(canonicalThenCanonical.calls).toHaveLength(4);
+    expect(
+      canonicalThenCanonical.calls.filter((c) => c.url.endsWith('/complete')),
+    ).toHaveLength(2);
+
+    for (const unrelated of [
+      {
+        body: {
+          success: false,
+          error: 'completion failed',
+          code: 'COMPLETION_FAILED',
+          nextAction: 'complete',
+        },
+        status: 500,
+      },
+      {
+        body: {
+          success: false,
+          error: 'completion failed',
+          code: 'COMPLETION_FAILED',
+          nextAction: 'complete',
+        },
+        status: 502,
+      },
+      {
+        body: {
+          success: false,
+          error: 'completion failed',
+          code: 'COMPLETION_FAILED',
+          nextAction: 'complete',
+        },
+        status: 422,
+      },
+      {
+        body: {
+          success: false,
+          error: 'completion failed',
+          code: 'OTHER_CODE',
+          nextAction: 'complete',
+        },
+        status: 503,
+      },
+      {
+        body: {
+          success: false,
+          error: 'completion failed',
+          code: 'COMPLETION_FAILED',
+          nextAction: 'wait',
+        },
+        status: 503,
+      },
+      {
+        body: {
+          success: false,
+          code: 'COMPLETION_FAILED',
+          nextAction: 'complete',
+        },
+        status: 503,
+      },
+      {
+        body: {
+          success: false,
+          error: { code: 'COMPLETION_FAILED' },
+          code: 'COMPLETION_FAILED',
+          nextAction: 'complete',
+        },
+        status: 503,
+      },
+      { body: { success: false, code: 'invalid_audio' }, status: 422 },
+      { body: { success: false, code: 'internal_error' }, status: 500 },
+      { body: { success: true }, status: 200 },
+      { body: { success: true, data: null }, status: 200 },
+      {
+        body: { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+        status: 200,
+      },
+      {
+        body: { success: true, data: { captureId: CAP_BAD, state: 'completed' } },
+        status: 200,
+      },
+    ]) {
+      const outcome = await runCompletionSequence(
+        [{ kind: 'response', body: unrelated.body, status: unrelated.status }],
+        true,
+      );
+      expect(outcome.result.outcome).toBe('failed');
+      expect(outcome.calls).toHaveLength(3);
+      expect(outcome.calls[0].url).toBe(receiptUrl());
+      expect(outcome.calls[1].url.endsWith('/process')).toBe(true);
+      expect(outcome.calls[2].url.endsWith('/complete')).toBe(true);
+    }
+
+    const withoutOptInCanonical = await runCompletionSequence([canonicalTop], false);
+    expect(withoutOptInCanonical.result.outcome).toBe('failed');
+    expect(withoutOptInCanonical.calls).toHaveLength(3);
+
+    const withoutOptInThrow = await runCompletionSequence([{ kind: 'throw' }], false);
+    expect(withoutOptInThrow.result).toEqual({
+      outcome: 'failed',
+      captureId: CAP_NEW,
+      code: 'fetch_failed',
+    });
+    expect(withoutOptInThrow.calls).toHaveLength(3);
+    expectNoSecrets();
+  });
 });
