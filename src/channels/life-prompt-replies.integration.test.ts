@@ -49,7 +49,8 @@ const setLastBotInstance = (bot: unknown) => {
   lastBotInstance = bot;
 };
 
-vi.mock('grammy', () => {
+vi.mock('grammy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('grammy')>();
   class MockBot {
     api = {
       sendMessage: vi.fn().mockResolvedValue({ message_id: 601 }),
@@ -71,7 +72,12 @@ vi.mock('grammy', () => {
       setLastBotInstance(this);
     }
   }
-  return { Bot: MockBot, Api: vi.fn(), webhookCallback: vi.fn(() => vi.fn()) };
+  return {
+    ...actual,
+    Bot: MockBot,
+    Api: vi.fn(),
+    webhookCallback: vi.fn(() => vi.fn()),
+  };
 });
 
 const LIFE_ENV = {
@@ -1487,4 +1493,174 @@ describe('ordinary owner voice status (LIFE-LF04-03)', () => {
       fetchSpy.mockRestore();
     }
   }, 15000);
+});
+
+describe('ordinary voice file lookup recovery (LIFE-LF02-01)', () => {
+  const VOICE_AUDIO = 'VOICE-BYTES-lookup-recovery-xyz';
+  const FILE_ID = 'file-lookup-recovery-1';
+
+  function getVoiceHandler(bot: any) {
+    const call = bot.on.mock.calls.find((c: any) => c[0] === 'message:voice');
+    return call?.[1];
+  }
+
+  function makeLookupCtx(overrides: any = {}) {
+    return {
+      message: {
+        message_id: 960,
+        date: Date.now() / 1000,
+        voice: {
+          file_id: FILE_ID,
+          file_size: 1000,
+          duration: 19,
+          mime_type: 'audio/mpeg',
+        },
+      },
+      chat: { id: 111, type: 'private' },
+      from: { id: 111, first_name: 'Ceo' },
+      api: {
+        getFile: vi.fn().mockResolvedValue({ file_path: 'voice/lookup_960.mp3' }),
+        editMessageText: vi.fn().mockResolvedValue(true),
+      },
+      reply: vi.fn().mockResolvedValue({ message_id: 801 }),
+      me: { username: 'test_bot' },
+      ...overrides,
+    };
+  }
+
+  function voiceReceiptUrl(): string {
+    return 'https://life.example.com/api/v1/journals/journal-1/voice/captures';
+  }
+
+  function mockVoiceTransport(
+    lifeHandler: (url: string, init?: RequestInit) => Response | Promise<Response>,
+  ) {
+    return vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const url = String(input);
+      if (url.includes('api.telegram.org')) {
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () =>
+            new TextEncoder().encode(VOICE_AUDIO).buffer as ArrayBuffer,
+        } as Response;
+      }
+      return lifeHandler(url, init);
+    });
+  }
+
+  function lifeCallsForReceipt(spy: ReturnType<typeof vi.spyOn>): Array<{ url: string; init?: RequestInit }> {
+    return spy.mock.calls
+      .map((c) => ({ url: String(c[0]), init: c[1] as RequestInit | undefined }))
+      .filter((c) => c.url.includes('/voice/captures'));
+  }
+
+  function lifeCompleted(captureId: string) {
+    return (url: string) => {
+      if (url === voiceReceiptUrl()) {
+        return jsonRes(
+          { success: true, data: { captureId, state: 'unfinished' } },
+          201,
+        );
+      }
+      if (url.endsWith('/process')) {
+        return jsonRes(
+          {
+            success: true,
+            data: { captureId, state: 'unfinished', nextAction: 'complete' },
+          },
+          200,
+        );
+      }
+      if (url.endsWith('/complete')) {
+        return jsonRes(
+          { success: true, data: { captureId, state: 'completed' } },
+          200,
+        );
+      }
+      throw new Error(`unexpected life url ${url}`);
+    };
+  }
+
+  beforeEach(() => {
+    _initTestDatabase();
+    clearLifeEnv();
+    setLifeEnv();
+    lastBotInstance = null;
+    promptConsumerRecords.length = 0;
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+    clearLifeEnv();
+  });
+
+  it.each([
+    { kind: 'HttpError', captureId: 'c1c1c1c1-1111-4111-8111-111111111111' },
+    { kind: 'GrammyError-503', captureId: 'd2d2d2d2-2222-4222-8222-222222222222' },
+  ])(
+    'ordinary voice file lookup recovery after $kind preserves bytes and completes',
+    async ({ kind, captureId }) => {
+      const { LIFE_VOICE_PROCESSING_STATUS, LIFE_VOICE_SAVED_STATUS } =
+        await import('./telegram.js');
+      const { GrammyError, HttpError } = await import('grammy');
+      const firstError =
+        kind === 'HttpError'
+          ? new HttpError(
+              `Network request for 'getFile' failed!`,
+              new Error('socket hang up'),
+            )
+          : new GrammyError(
+              `Call to 'getFile' failed!`,
+              { ok: false, error_code: 503, description: 'Service Unavailable' } as never,
+              'getFile',
+              {},
+            );
+
+      const fetchSpy = mockVoiceTransport(lifeCompleted(captureId));
+      const opts = makeOpts();
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const ctx = makeLookupCtx({
+        api: {
+          getFile: vi
+            .fn()
+            .mockRejectedValueOnce(firstError)
+            .mockResolvedValue({ file_path: 'voice/lookup_960.mp3' }),
+          editMessageText: vi.fn().mockResolvedValue(true),
+        },
+      });
+      await getVoiceHandler(lastBotInstance)(ctx);
+
+      expect(ctx.api.getFile).toHaveBeenCalledTimes(2);
+      expect(ctx.api.getFile).toHaveBeenNthCalledWith(1, FILE_ID);
+      expect(ctx.api.getFile).toHaveBeenNthCalledWith(2, FILE_ID);
+
+      const lifeCalls = lifeCallsForReceipt(fetchSpy);
+      expect(lifeCalls).toHaveLength(3);
+      expect(lifeCalls[0].url).toBe(voiceReceiptUrl());
+      expect(lifeCalls[1].url).toBe(`${voiceReceiptUrl()}/${captureId}/process`);
+      expect(lifeCalls[2].url).toBe(`${voiceReceiptUrl()}/${captureId}/complete`);
+
+      const form = lifeCalls[0].init?.body as FormData;
+      expect(form.get('sourceMessageKey')).toBe('telegram:111:960');
+      expect(form.get('promptInstanceId')).toBeNull();
+      expect(form.get('durationSeconds')).toBe('19');
+      const audioPart = form.get('audio') as Blob;
+      expect(audioPart).toBeInstanceOf(Blob);
+      expect(await audioPart.text()).toBe(VOICE_AUDIO);
+      expect(audioPart.type).toBe('audio/mpeg');
+      expect((audioPart as unknown as { name?: string }).name).toBe('voice.mp3');
+
+      expect(ctx.reply).toHaveBeenCalledWith(LIFE_VOICE_PROCESSING_STATUS);
+      const edit = ctx.api.editMessageText as ReturnType<typeof vi.fn>;
+      expect(edit).toHaveBeenCalledTimes(1);
+      expect(edit.mock.calls[0][2]).toBe(LIFE_VOICE_SAVED_STATUS);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      await ch.disconnect();
+    },
+    15000,
+  );
 });

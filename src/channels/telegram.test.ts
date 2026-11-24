@@ -53,7 +53,8 @@ vi.mock('./life-prompt-delivery.js', async (importOriginal) => {
 // Track all created bot instances for assertions
 let lastBotInstance: any = null;
 
-vi.mock('grammy', () => {
+vi.mock('grammy', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('grammy')>();
   const setLastBotInstance = (bot: unknown) => {
     lastBotInstance = bot;
   };
@@ -82,6 +83,7 @@ vi.mock('grammy', () => {
   }
 
   return {
+    ...actual,
     Bot: MockBot,
     Api: vi.fn(),
     webhookCallback: vi.fn(() => vi.fn()),
@@ -2889,6 +2891,259 @@ describe('TelegramChannel', () => {
       expect(
         promptCalls.filter((c) => c.url.endsWith('/complete')),
       ).toHaveLength(1);
+    });
+
+    async function spyLookupFailureLogs() {
+      const { logger } = await import('../logger.js');
+      return vi.spyOn(logger, 'error').mockImplementation((() => {}) as never);
+    }
+
+    async function makeLookupGrammyError(errorCode: number) {
+      const { GrammyError } = await import('grammy');
+      return new GrammyError(
+        `Call to 'getFile' failed!`,
+        { ok: false, error_code: errorCode, description: `mock ${errorCode}` } as never,
+        'getFile',
+        {},
+      );
+    }
+
+    async function makeLookupHttpError() {
+      const { HttpError } = await import('grammy');
+      return new HttpError(
+        `Network request for 'getFile' failed!`,
+        new Error('socket hang up'),
+      );
+    }
+
+    it('exhausts the ordinary owner lookup budget after two transient failures', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await import('./life-voice-capture.js');
+      vi.mocked(forwardVoiceCapture).mockClear();
+      const errorSpy = await spyLookupFailureLogs();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as Response);
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      const ctx = makeOwnerVoiceCtx({
+        api: {
+          getFile: vi
+            .fn()
+            .mockRejectedValueOnce(await makeLookupHttpError())
+            .mockRejectedValueOnce(await makeLookupGrammyError(500)),
+        },
+        reply: vi.fn().mockResolvedValue(undefined),
+      });
+      await handler(ctx);
+
+      expect(ctx.api.getFile).toHaveBeenCalledTimes(2);
+      expect(ctx.api.getFile).toHaveBeenNthCalledWith(1, 'file-abc');
+      expect(ctx.api.getFile).toHaveBeenNthCalledWith(2, 'file-abc');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const loggedObj = errorSpy.mock.calls[0][0] as Record<string, unknown>;
+      expect(loggedObj).toMatchObject({
+        chatId: '111',
+        messageId: '222',
+        code: 'telegram_voice_getfile_failed',
+        status: 500,
+      });
+      expect(loggedObj).not.toHaveProperty('err');
+      expect(loggedObj).not.toHaveProperty('error');
+      const loggedText = JSON.stringify(errorSpy.mock.calls);
+      expect(loggedText).not.toContain('token123');
+      expect(loggedText).not.toContain('api.telegram.org');
+      expect(loggedText).not.toContain('voice/file_123.ogg');
+      expect(loggedText).not.toContain('socket hang up');
+
+      errorSpy.mockRestore();
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes a single lookup for a permanent getFile error without retry', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await import('./life-voice-capture.js');
+      vi.mocked(forwardVoiceCapture).mockClear();
+      const errorSpy = await spyLookupFailureLogs();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as Response);
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      const ctx = makeOwnerVoiceCtx({
+        api: { getFile: vi.fn().mockRejectedValue(await makeLookupGrammyError(400)) },
+        reply: vi.fn().mockResolvedValue(undefined),
+      });
+      await handler(ctx);
+
+      expect(ctx.api.getFile).toHaveBeenCalledTimes(1);
+      expect(ctx.api.getFile).toHaveBeenCalledWith('file-abc');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const loggedObj = errorSpy.mock.calls[0][0] as Record<string, unknown>;
+      expect(loggedObj).toMatchObject({
+        chatId: '111',
+        messageId: '222',
+        code: 'telegram_voice_getfile_failed',
+        status: 400,
+      });
+      expect(loggedObj).not.toHaveProperty('err');
+      const loggedText = JSON.stringify(errorSpy.mock.calls);
+      expect(loggedText).not.toContain('token123');
+      expect(loggedText).not.toContain('api.telegram.org');
+
+      errorSpy.mockRestore();
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes a single lookup for a rate-limited getFile error without retry', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await import('./life-voice-capture.js');
+      vi.mocked(forwardVoiceCapture).mockClear();
+      const errorSpy = await spyLookupFailureLogs();
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockResolvedValue({ ok: true } as Response);
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      const ctx = makeOwnerVoiceCtx({
+        api: { getFile: vi.fn().mockRejectedValue(await makeLookupGrammyError(429)) },
+        reply: vi.fn().mockResolvedValue(undefined),
+      });
+      await handler(ctx);
+
+      expect(ctx.api.getFile).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const loggedObj = errorSpy.mock.calls[0][0] as Record<string, unknown>;
+      expect(loggedObj).toMatchObject({
+        chatId: '111',
+        messageId: '222',
+        code: 'telegram_voice_getfile_failed',
+        status: 429,
+      });
+      expect(loggedObj).not.toHaveProperty('err');
+
+      errorSpy.mockRestore();
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes a single lookup when returned metadata fails size or path guards', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await import('./life-voice-capture.js');
+      const errorSpy = await spyLookupFailureLogs();
+
+      for (const fileResult of [
+        { file_path: 'voice/big.ogg', file_size: 26 * 1024 * 1024 },
+        {},
+      ]) {
+        vi.mocked(forwardVoiceCapture).mockClear();
+        const fetchSpy = vi
+          .spyOn(globalThis, 'fetch')
+          .mockResolvedValue({ ok: true } as Response);
+        const { opts, handler } = await connectOwnerVoiceChannel();
+        const ctx = makeOwnerVoiceCtx({
+          api: { getFile: vi.fn().mockResolvedValue(fileResult) },
+          reply: vi.fn().mockResolvedValue(undefined),
+        });
+        await handler(ctx);
+
+        expect(ctx.api.getFile).toHaveBeenCalledTimes(1);
+        expect(ctx.api.getFile).toHaveBeenCalledWith('file-abc');
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(forwardVoiceCapture).not.toHaveBeenCalled();
+        expect(ctx.reply).not.toHaveBeenCalled();
+        expect(opts.onMessage).toHaveBeenCalledTimes(1);
+        fetchSpy.mockRestore();
+      }
+
+      expect(errorSpy).not.toHaveBeenCalled();
+      errorSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes a single lookup without retry for ineligible updates admitted to the ordinary path', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await import('./life-voice-capture.js');
+      const errorSpy = await spyLookupFailureLogs();
+
+      const cases: Array<{ name: string; overrides: Record<string, unknown> }> = [
+        { name: 'group', overrides: { chat: { id: 111, type: 'group' } } },
+        {
+          name: 'intruder',
+          overrides: { from: { id: 999, first_name: 'Other' } },
+        },
+        {
+          name: 'group-reply',
+          overrides: {
+            chat: { id: 111, type: 'group' },
+            message: {
+              message_id: 222,
+              date: Date.now() / 1000,
+              voice: {
+                file_id: 'file-abc',
+                file_size: 1000,
+                duration: 12,
+                mime_type: 'audio/ogg',
+              },
+              reply_to_message: { message_id: 10 },
+            },
+          },
+        },
+      ];
+
+      for (const c of cases) {
+        vi.mocked(forwardVoiceCapture).mockClear();
+        const fetchSpy = vi
+          .spyOn(globalThis, 'fetch')
+          .mockResolvedValue({ ok: true } as Response);
+        const { opts, handler } = await connectOwnerVoiceChannel();
+        const ctx = {
+          ...makeOwnerVoiceCtx(),
+          ...c.overrides,
+          api: { getFile: vi.fn().mockRejectedValue(await makeLookupHttpError()) },
+          reply: vi.fn().mockResolvedValue(undefined),
+        };
+        await handler(ctx);
+
+        expect(ctx.api.getFile).toHaveBeenCalledTimes(1);
+        expect(fetchSpy).not.toHaveBeenCalled();
+        expect(forwardVoiceCapture).not.toHaveBeenCalled();
+        expect(ctx.reply).not.toHaveBeenCalled();
+        expect(opts.onMessage).toHaveBeenCalledTimes(1);
+        fetchSpy.mockRestore();
+      }
+
+      expect(errorSpy).toHaveBeenCalledTimes(cases.length);
+      for (const call of errorSpy.mock.calls) {
+        const loggedObj = call[0] as Record<string, unknown>;
+        expect(loggedObj).toMatchObject({
+          chatId: '111',
+          messageId: '222',
+          code: 'telegram_voice_getfile_failed',
+        });
+        expect(loggedObj).not.toHaveProperty('status');
+        expect(loggedObj).not.toHaveProperty('err');
+      }
+      const loggedText = JSON.stringify(errorSpy.mock.calls);
+      expect(loggedText).not.toContain('token123');
+      expect(loggedText).not.toContain('api.telegram.org');
+      expect(loggedText).not.toContain('socket hang up');
+
+      errorSpy.mockRestore();
+      clearLifeEnv();
     });
   });
 

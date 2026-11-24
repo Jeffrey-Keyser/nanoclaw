@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import https from 'https';
 import { createServer, Server } from 'http';
-import { Api, Bot, webhookCallback } from 'grammy';
+import { Api, Bot, GrammyError, HttpError, webhookCallback } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { getRecentToolEvents } from '../db/tool-events.js';
@@ -49,6 +49,25 @@ export const LIFE_VOICE_PROCESSING_STATUS = 'Sent to Life for processing.';
 export const LIFE_VOICE_SAVED_STATUS = 'Saved to Life.';
 export const LIFE_VOICE_UNCONFIRMED_STATUS = 'Life save unconfirmed.';
 export const LIFE_VOICE_STATUS_TIMEOUT_MS = 5000;
+
+export const TELEGRAM_VOICE_GETFILE_FAILURE_CODE =
+  'telegram_voice_getfile_failed';
+
+function isTransientVoiceLookupError(err: unknown): boolean {
+  if (err instanceof HttpError) return true;
+  if (err instanceof GrammyError) {
+    const code = err.error_code;
+    return typeof code === 'number' && code >= 500 && code <= 599;
+  }
+  return false;
+}
+
+function voiceLookupErrorStatus(err: unknown): number | undefined {
+  if (err instanceof GrammyError && typeof err.error_code === 'number') {
+    return err.error_code;
+  }
+  return undefined;
+}
 
 function withStatusDeadline<T>(promise: Promise<T>, ms: number): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1220,13 +1239,52 @@ export class TelegramChannel implements Channel {
       return;
     }
 
-    let file: { file_path?: string; file_size?: number };
-    try {
-      file = await ctx.api.getFile(fileId);
-    } catch (err) {
-      logger.error({ chatId, messageId, err }, 'Telegram voice getFile failed');
-      return;
+    const replyToId = ctx.message.reply_to_message?.message_id;
+    const isOrdinaryNote =
+      typeof replyToId !== 'number' || !Number.isInteger(replyToId);
+    const ordinaryOwnerEligible =
+      isOrdinaryNote && this.isVoiceStatusEligible(ctx, chatId, chatJid);
+
+    let file: { file_path?: string; file_size?: number } | undefined;
+    const maxLookupAttempts = ordinaryOwnerEligible ? 2 : 1;
+    for (
+      let lookupAttempt = 1;
+      lookupAttempt <= maxLookupAttempts;
+      lookupAttempt += 1
+    ) {
+      try {
+        file = await ctx.api.getFile(fileId);
+        break;
+      } catch (err) {
+        const transient = isTransientVoiceLookupError(err);
+        const exhausted = lookupAttempt >= maxLookupAttempts;
+        if (!ordinaryOwnerEligible || !transient || exhausted) {
+          const status = voiceLookupErrorStatus(err);
+          if (status !== undefined) {
+            logger.error(
+              {
+                chatId,
+                messageId,
+                code: TELEGRAM_VOICE_GETFILE_FAILURE_CODE,
+                status,
+              },
+              'Telegram voice getFile failed',
+            );
+          } else {
+            logger.error(
+              {
+                chatId,
+                messageId,
+                code: TELEGRAM_VOICE_GETFILE_FAILURE_CODE,
+              },
+              'Telegram voice getFile failed',
+            );
+          }
+          return;
+        }
+      }
     }
+    if (!file) return;
     if (
       typeof file.file_size === 'number' &&
       file.file_size > TELEGRAM_VOICE_MAX_BYTES
@@ -1243,11 +1301,7 @@ export class TelegramChannel implements Channel {
       return;
     }
 
-    const replyToId = ctx.message.reply_to_message?.message_id;
-    const isOrdinaryNote =
-      typeof replyToId !== 'number' || !Number.isInteger(replyToId);
-    const downloadRetryEligible =
-      isOrdinaryNote && this.isVoiceStatusEligible(ctx, chatId, chatJid);
+    const downloadRetryEligible = ordinaryOwnerEligible;
 
     const fileUrl = buildTelegramFileUrl(this.botToken, filePath);
     const maxDownloadAttempts = downloadRetryEligible ? 2 : 1;
