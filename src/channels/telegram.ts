@@ -1403,6 +1403,7 @@ export class TelegramChannel implements Channel {
               onProcessDispatch: requestStatus,
               retryReceiptOnFetchFailure: true,
               retryCompletionOnTransientFailure: true,
+              retryProcessOnRetryableStructuringFailure: true,
             }
           : {}),
       });

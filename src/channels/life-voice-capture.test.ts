@@ -1676,4 +1676,151 @@ describe('forwardVoiceCapture', () => {
     expect(withoutOptInThrow.calls).toHaveLength(3);
     expectNoSecrets();
   });
+
+  it('repeats an identical process POST once for a retryable structuring failure and follows normal outcomes', async () => {
+    type ProcessStep =
+      | { kind: 'throw' }
+      | { kind: 'response'; body: unknown; status: number };
+
+    const retryableFailure = {
+      kind: 'response' as const,
+      status: 200,
+      body: {
+        success: true,
+        data: {
+          captureId: CAP_NEW,
+          state: 'failed',
+          nextAction: 'process',
+          failure: { stage: 'structuring', code: 'LLM_TIMEOUT', retryable: true },
+        },
+      },
+    };
+    const completeAction = {
+      kind: 'response' as const,
+      status: 200,
+      body: {
+        success: true,
+        data: { captureId: CAP_NEW, state: 'unfinished', nextAction: 'complete' },
+      },
+    };
+    const resolveAction = {
+      kind: 'response' as const,
+      status: 200,
+      body: {
+        success: true,
+        data: { captureId: CAP_NEW, state: 'review_ready', nextAction: 'resolve' },
+      },
+    };
+
+    async function runProcessSequence(
+      processSteps: ProcessStep[],
+      withOptIn: boolean,
+    ): Promise<{
+      result: { outcome: string; code?: string; captureId?: string; needsOwnerReview?: boolean };
+      calls: Array<{ url: string; init?: RequestInit }>;
+    }> {
+      let processIndex = 0;
+      const { fetchImpl, calls } = recordingFetch((url) => {
+        if (url === receiptUrl()) {
+          return jsonResponse(
+            { success: true, data: { captureId: CAP_NEW, state: 'unfinished' } },
+            201,
+          );
+        }
+        if (url.endsWith('/process')) {
+          const step = processSteps[Math.min(processIndex, processSteps.length - 1)];
+          processIndex += 1;
+          if (step.kind === 'throw') throw new Error('network down');
+          return jsonResponse(step.body, step.status);
+        }
+        if (url.endsWith('/complete')) {
+          return jsonResponse(
+            { success: true, data: { captureId: CAP_NEW, state: 'completed' } },
+            200,
+          );
+        }
+        throw new Error(`unexpected url ${url}`);
+      });
+      const result = await forwardVoiceCapture({
+        fetchImpl,
+        config: config(),
+        audio: audioBytes(),
+        mimeType: 'audio/ogg',
+        sourceMessageKey: SOURCE_KEY,
+        ...(withOptIn
+          ? { retryProcessOnRetryableStructuringFailure: true as const }
+          : {}),
+      });
+      return { result, calls };
+    }
+
+    const retried = await runProcessSequence([retryableFailure, completeAction], true);
+    expect(retried.result).toEqual({ outcome: 'completed', captureId: CAP_NEW });
+    expect(retried.calls.map((c) => c.url)).toEqual([
+      receiptUrl(),
+      `${receiptUrl()}/${CAP_NEW}/process`,
+      `${receiptUrl()}/${CAP_NEW}/process`,
+      `${receiptUrl()}/${CAP_NEW}/complete`,
+    ]);
+    const firstProcess = retried.calls[1].init;
+    const repeatProcess = retried.calls[2].init;
+    expect(repeatProcess?.method).toBe('POST');
+    expect(repeatProcess?.headers).toEqual(firstProcess?.headers);
+    expect(repeatProcess?.body).toBe(firstProcess?.body);
+    expect(
+      (repeatProcess?.headers as Record<string, string>)['Authorization'],
+    ).toBe(`Bearer ${SECRET_TOKEN}`);
+
+    const retriedToReview = await runProcessSequence([retryableFailure, resolveAction], true);
+    expect(retriedToReview.result).toEqual({
+      outcome: 'review_in_life',
+      captureId: CAP_NEW,
+      needsOwnerReview: true,
+    });
+    expect(retriedToReview.calls).toHaveLength(3);
+    expect(retriedToReview.calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+
+    const exhausted = await runProcessSequence([retryableFailure, retryableFailure], true);
+    expect(exhausted.result).toEqual({
+      outcome: 'failed',
+      captureId: CAP_NEW,
+      code: 'capture_failed',
+    });
+    expect(exhausted.calls.filter((c) => c.url.endsWith('/process'))).toHaveLength(2);
+    expect(exhausted.calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+
+    const throwOnRepeat = await runProcessSequence([retryableFailure, { kind: 'throw' }], true);
+    expect(throwOnRepeat.result).toEqual({
+      outcome: 'failed',
+      captureId: CAP_NEW,
+      code: 'fetch_failed',
+    });
+    expect(throwOnRepeat.calls).toHaveLength(3);
+
+    const ineligibleFirst = [
+      { body: { success: true, data: { captureId: CAP_NEW, state: 'failed', nextAction: 'process', failure: { stage: 'other', code: 'LLM_TIMEOUT', retryable: true } } }, status: 200 },
+      { body: { success: true, data: { captureId: CAP_NEW, state: 'failed', nextAction: 'process', failure: { stage: 'structuring', code: 'LLM_TIMEOUT', retryable: false } } }, status: 200 },
+      { body: { success: true, data: { captureId: CAP_NEW, state: 'failed', nextAction: 'process', failure: { stage: 'structuring', code: '', retryable: true } } }, status: 200 },
+      { body: { success: true, data: { captureId: CAP_NEW, state: 'failed', nextAction: 'process', failure: { stage: 'structuring', code: 'LLM_TIMEOUT' } } }, status: 200 },
+      { body: { success: true, data: { captureId: CAP_NEW, state: 'failed', nextAction: 'wait', failure: { stage: 'structuring', code: 'LLM_TIMEOUT', retryable: true } } }, status: 200 },
+      { body: { success: true, data: { captureId: CAP_NEW, state: 'failed', nextAction: 'process', failure: { stage: 'structuring', code: 'LLM_TIMEOUT', retryable: true } } }, status: 202 },
+      { body: { success: true, data: { captureId: CAP_BAD, state: 'failed', nextAction: 'process', failure: { stage: 'structuring', code: 'LLM_TIMEOUT', retryable: true } } }, status: 200 },
+      { body: { success: false, code: 'LLM_TIMEOUT', nextAction: 'process' }, status: 500 },
+    ];
+    for (const unrelated of ineligibleFirst) {
+      const outcome = await runProcessSequence(
+        [{ kind: 'response', body: unrelated.body, status: unrelated.status }],
+        true,
+      );
+      expect(outcome.result.outcome).toBe('failed');
+      expect(outcome.calls.filter((c) => c.url.endsWith('/process'))).toHaveLength(1);
+      expect(outcome.calls.some((c) => c.url.endsWith('/complete'))).toBe(false);
+    }
+
+    const withoutOptIn = await runProcessSequence([retryableFailure, completeAction], false);
+    expect(withoutOptIn.result.outcome).toBe('failed');
+    expect(withoutOptIn.calls.filter((c) => c.url.endsWith('/process'))).toHaveLength(1);
+    expect(withoutOptIn.calls).toHaveLength(2);
+    expectNoSecrets();
+  });
 });

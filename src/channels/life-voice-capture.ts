@@ -22,6 +22,7 @@ export interface ForwardVoiceCaptureInput {
   onProcessDispatch?: () => void;
   retryReceiptOnFetchFailure?: boolean;
   retryCompletionOnTransientFailure?: boolean;
+  retryProcessOnRetryableStructuringFailure?: boolean;
 }
 
 export type ForwardVoiceCaptureOutcome =
@@ -204,6 +205,28 @@ function isCompletionRetryable(
   if (completionField(body, 'code') !== 'COMPLETION_FAILED') return false;
   if (completionField(body, 'nextAction') !== 'complete') return false;
   return true;
+}
+
+function isRetryableStructuringFailure(
+  status: number,
+  data: Record<string, unknown>,
+): boolean {
+  if (status !== 200) return false;
+  if (stateFromData(data) !== 'failed') return false;
+  if (nextActionFromData(data) !== 'process') return false;
+  const failure = data['failure'];
+  if (
+    failure === null ||
+    typeof failure !== 'object' ||
+    Array.isArray(failure)
+  ) {
+    return false;
+  }
+  const record = failure as Record<string, unknown>;
+  if (record['stage'] !== 'structuring') return false;
+  const code = record['code'];
+  if (typeof code !== 'string' || code.length === 0) return false;
+  return record['retryable'] === true;
 }
 
 function codeFromData(data: Record<string, unknown>): string | undefined {
@@ -391,9 +414,8 @@ export async function forwardVoiceCapture(
         // Status notification stays failure-isolated; Life workflow continues.
       }
     }
-    let processRes: Response;
-    try {
-      processRes = await fetchImpl(processUrl, {
+    const postProcess = (): Promise<Response> =>
+      fetchImpl(processUrl, {
         method: 'POST',
         headers: {
           Authorization: authHeader,
@@ -401,50 +423,73 @@ export async function forwardVoiceCapture(
         },
         body: JSON.stringify({}),
       });
-    } catch {
-      logger.error(
-        { sourceMessageKey, captureId, code: 'fetch_failed' },
-        'Life voice process request failed',
-      );
-      return { outcome: 'failed', captureId, code: 'fetch_failed' };
-    }
 
-    const processBody = await readJsonBody(processRes);
-    if (!processRes.ok || processBody['success'] !== true) {
-      const code = errorCodeFromBody(processBody, processRes.status);
-      logger.warn(
-        { sourceMessageKey, captureId, status: processRes.status, code },
-        'Life voice process rejected',
-      );
-      return { outcome: 'failed', captureId, code };
-    }
+    let processRes: Response;
+    let processData: Record<string, unknown>;
+    let processRetryUsed = false;
+    for (;;) {
+      try {
+        processRes = await postProcess();
+      } catch {
+        logger.error(
+          { sourceMessageKey, captureId, code: 'fetch_failed' },
+          'Life voice process request failed',
+        );
+        return { outcome: 'failed', captureId, code: 'fetch_failed' };
+      }
 
-    const processData = readDataEnvelope(processBody);
-    if (!processData) {
-      logger.warn(
-        {
-          sourceMessageKey,
-          captureId,
-          status: processRes.status,
-          code: 'malformed_envelope',
-        },
-        'Life voice process malformed envelope',
-      );
-      return { outcome: 'failed', captureId, code: 'malformed_envelope' };
-    }
+      const processBody = await readJsonBody(processRes);
+      if (!processRes.ok || processBody['success'] !== true) {
+        const code = errorCodeFromBody(processBody, processRes.status);
+        logger.warn(
+          { sourceMessageKey, captureId, status: processRes.status, code },
+          'Life voice process rejected',
+        );
+        return { outcome: 'failed', captureId, code };
+      }
 
-    const processCaptureId = captureIdFromData(processData);
-    if (!processCaptureId || processCaptureId !== captureId) {
-      logger.warn(
-        {
-          sourceMessageKey,
-          captureId,
-          status: processRes.status,
-          code: 'capture_id_mismatch',
-        },
-        'Life voice process identity mismatch',
-      );
-      return { outcome: 'failed', captureId, code: 'capture_id_mismatch' };
+      const envelope = readDataEnvelope(processBody);
+      if (!envelope) {
+        logger.warn(
+          {
+            sourceMessageKey,
+            captureId,
+            status: processRes.status,
+            code: 'malformed_envelope',
+          },
+          'Life voice process malformed envelope',
+        );
+        return { outcome: 'failed', captureId, code: 'malformed_envelope' };
+      }
+      processData = envelope;
+
+      const processCaptureId = captureIdFromData(processData);
+      if (!processCaptureId || processCaptureId !== captureId) {
+        logger.warn(
+          {
+            sourceMessageKey,
+            captureId,
+            status: processRes.status,
+            code: 'capture_id_mismatch',
+          },
+          'Life voice process identity mismatch',
+        );
+        return { outcome: 'failed', captureId, code: 'capture_id_mismatch' };
+      }
+
+      if (
+        !processRetryUsed &&
+        input.retryProcessOnRetryableStructuringFailure === true &&
+        isRetryableStructuringFailure(processRes.status, processData)
+      ) {
+        processRetryUsed = true;
+        logger.info(
+          { sourceMessageKey, captureId },
+          'Life voice structuring failed as retryable; repeating process',
+        );
+        continue;
+      }
+      break;
     }
 
     const processState = stateFromData(processData);

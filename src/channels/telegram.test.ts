@@ -1250,6 +1250,150 @@ describe('TelegramChannel', () => {
       clearLifeEnv();
     });
 
+    it('repeats the identical process POST once for an ordinary owner structuring retry without new status or download', async () => {
+      process.env.LIFE_API_URL = 'https://life.example.com';
+      process.env.LIFE_JOURNAL_ID = '42';
+      process.env.LIFE_API_TOKEN = 'test-token-abc';
+      const actual =
+        await vi.importActual<typeof import('./life-voice-capture.js')>(
+          './life-voice-capture.js',
+        );
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockImplementationOnce(
+        actual.forwardVoiceCapture,
+      );
+
+      const captureId = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
+      const audioText = 'ordinary-structuring-retry-audio';
+      const receiptUrl =
+        'https://life.example.com/api/v1/journals/42/voice/captures';
+      const lifeCalls: Array<{ url: string; init?: RequestInit }> = [];
+      let processAttempts = 0;
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation(async (input: any, init?: any) => {
+          const url = String(input);
+          if (url.includes('api.telegram.org')) {
+            return {
+              ok: true,
+              status: 200,
+              arrayBuffer: async () =>
+                new TextEncoder().encode(audioText).buffer as ArrayBuffer,
+            } as Response;
+          }
+          lifeCalls.push({ url, init });
+          if (url === receiptUrl) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: { captureId, state: 'unfinished' },
+              }),
+              {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          if (url === `${receiptUrl}/${captureId}/process`) {
+            processAttempts += 1;
+            if (processAttempts === 1) {
+              return new Response(
+                JSON.stringify({
+                  success: true,
+                  data: {
+                    captureId,
+                    state: 'failed',
+                    nextAction: 'process',
+                    failure: {
+                      stage: 'structuring',
+                      code: 'LLM_TIMEOUT',
+                      retryable: true,
+                    },
+                  },
+                }),
+                {
+                  status: 200,
+                  headers: { 'Content-Type': 'application/json' },
+                },
+              );
+            }
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: {
+                  captureId,
+                  state: 'unfinished',
+                  nextAction: 'complete',
+                },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          if (url === `${receiptUrl}/${captureId}/complete`) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: { captureId, state: 'completed' },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          throw new Error(`unexpected url ${url}`);
+        });
+
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+
+      const handler = getVoiceHandler(lastBotInstance);
+      const ctx = {
+        ...makeVoiceCtx(),
+        reply: vi.fn().mockResolvedValue({ message_id: 77 }),
+        chat: { id: 111, type: 'private' },
+        from: { id: 111, first_name: 'Ceo' },
+      };
+      await handler(ctx);
+
+      expect(lifeCalls.map((c) => c.url)).toEqual([
+        receiptUrl,
+        `${receiptUrl}/${captureId}/process`,
+        `${receiptUrl}/${captureId}/process`,
+        `${receiptUrl}/${captureId}/complete`,
+      ]);
+      const [firstProcess, repeatProcess] = [lifeCalls[1].init, lifeCalls[2].init];
+      expect(repeatProcess?.method).toBe('POST');
+      expect(repeatProcess?.headers).toEqual(firstProcess?.headers);
+      expect(repeatProcess?.body).toBe(firstProcess?.body);
+      expect(
+        (repeatProcess?.headers as Record<string, string>)['Authorization'],
+      ).toBe('Bearer test-token-abc');
+
+      const downloads = fetchSpy.mock.calls.filter((c) =>
+        String(c[0]).includes('api.telegram.org'),
+      );
+      expect(downloads).toHaveLength(1);
+      expect(ctx.api.getFile).toHaveBeenCalledTimes(1);
+      const statusReplies = ctx.reply.mock.calls.filter(
+        (c: unknown[]) => c[0] === 'Sent to Life for processing.',
+      );
+      expect(statusReplies).toHaveLength(1);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
     it('does not retry an HTTP error receipt response for ordinary owner voice', async () => {
       process.env.LIFE_API_URL = 'https://life.example.com';
       process.env.LIFE_JOURNAL_ID = '42';
