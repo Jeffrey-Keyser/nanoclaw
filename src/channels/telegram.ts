@@ -1243,25 +1243,63 @@ export class TelegramChannel implements Channel {
       return;
     }
 
-    let audioBytes: Buffer;
-    try {
-      const downloadRes = await fetch(
-        buildTelegramFileUrl(this.botToken, filePath),
-      );
+    const replyToId = ctx.message.reply_to_message?.message_id;
+    const isOrdinaryNote =
+      typeof replyToId !== 'number' || !Number.isInteger(replyToId);
+    const downloadRetryEligible =
+      isOrdinaryNote && this.isVoiceStatusEligible(ctx, chatId, chatJid);
+
+    const fileUrl = buildTelegramFileUrl(this.botToken, filePath);
+    const maxDownloadAttempts = downloadRetryEligible ? 2 : 1;
+    let audioBytes: Buffer | undefined;
+    let downloadFailureCode = 'fetch_failed';
+    let downloadFailureStatus: number | undefined;
+    for (
+      let downloadAttempt = 1;
+      downloadAttempt <= maxDownloadAttempts;
+      downloadAttempt += 1
+    ) {
+      let downloadRes: Response;
+      try {
+        downloadRes = await fetch(fileUrl);
+      } catch {
+        downloadFailureCode = 'fetch_failed';
+        downloadFailureStatus = undefined;
+        continue;
+      }
       if (!downloadRes.ok) {
+        downloadFailureCode = 'http_error';
+        downloadFailureStatus = downloadRes.status;
+        if (downloadRes.status < 500 || downloadRes.status > 599) break;
+        continue;
+      }
+      try {
+        const downloaded = await downloadRes.arrayBuffer();
+        audioBytes = Buffer.from(downloaded);
+        break;
+      } catch {
+        downloadFailureCode = 'body_read_failed';
+        downloadFailureStatus = downloadRes.status;
+        continue;
+      }
+    }
+    if (audioBytes === undefined) {
+      if (downloadFailureStatus !== undefined) {
         logger.error(
-          { chatId, messageId, status: downloadRes.status },
+          {
+            chatId,
+            messageId,
+            code: downloadFailureCode,
+            status: downloadFailureStatus,
+          },
           'Telegram voice download failed',
         );
-        return;
+      } else {
+        logger.error(
+          { chatId, messageId, code: downloadFailureCode },
+          'Telegram voice download failed',
+        );
       }
-      const downloaded = await downloadRes.arrayBuffer();
-      audioBytes = Buffer.from(downloaded);
-    } catch (err) {
-      logger.error(
-        { chatId, messageId, err },
-        'Telegram voice download failed',
-      );
       return;
     }
     if (audioBytes.length > TELEGRAM_VOICE_MAX_BYTES) {
@@ -1276,11 +1314,8 @@ export class TelegramChannel implements Channel {
     const mimeType = voice?.mime_type || 'audio/ogg';
     const durationSeconds =
       typeof voice?.duration === 'number' ? voice.duration : undefined;
-    const replyToId = ctx.message.reply_to_message?.message_id;
-    const isOrdinaryNote =
-      typeof replyToId !== 'number' || !Number.isInteger(replyToId);
-    const statusEligible =
-      isOrdinaryNote && this.isVoiceStatusEligible(ctx, chatId, chatJid);    let statusMessageId: number | undefined;
+    const statusEligible = downloadRetryEligible;
+    let statusMessageId: number | undefined;
     let statusSendPromise: Promise<void> | undefined;
     const requestStatus = (): void => {
       if (!statusEligible || typeof ctx.reply !== 'function') return;

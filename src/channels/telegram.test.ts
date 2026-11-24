@@ -2098,6 +2098,420 @@ describe('TelegramChannel', () => {
       fetchSpy.mockRestore();
       clearLifeEnv();
     });
+
+    function telegramOkResponse(audioText: string): Response {
+      return {
+        ok: true,
+        status: 200,
+        arrayBuffer: async () =>
+          new TextEncoder().encode(audioText).buffer as ArrayBuffer,
+      } as Response;
+    }
+
+    function telegramErrorResponse(status: number): Response {
+      return { ok: false, status } as Response;
+    }
+
+    async function useRealVoiceForwarder() {
+      const actual =
+        await vi.importActual<typeof import('./life-voice-capture.js')>(
+          './life-voice-capture.js',
+        );
+      const { forwardVoiceCapture } = await import(
+        './life-voice-capture.js'
+      );
+      vi.mocked(forwardVoiceCapture).mockImplementationOnce(
+        actual.forwardVoiceCapture,
+      );
+      return { forwardVoiceCapture };
+    }
+
+    function mockVoiceDownloadFetch(args: {
+      captureId: string;
+      telegram: (attempt: number) => Promise<Response> | Response;
+    }) {
+      const receiptUrl =
+        'https://life.example.com/api/v1/journals/42/voice/captures';
+      const lifeCalls: Array<{ url: string; init?: RequestInit }> = [];
+      const telegramCalls: string[] = [];
+      let telegramAttempts = 0;
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation(async (input: any, init?: any) => {
+          const url = String(input);
+          if (url.includes('api.telegram.org')) {
+            telegramAttempts += 1;
+            telegramCalls.push(url);
+            return args.telegram(telegramAttempts);
+          }
+          lifeCalls.push({ url, init });
+          if (url === receiptUrl) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: { captureId: args.captureId, state: 'unfinished' },
+              }),
+              {
+                status: 201,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          if (url === `${receiptUrl}/${args.captureId}/process`) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: {
+                  captureId: args.captureId,
+                  state: 'unfinished',
+                  nextAction: 'complete',
+                },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          if (url === `${receiptUrl}/${args.captureId}/complete`) {
+            return new Response(
+              JSON.stringify({
+                success: true,
+                data: { captureId: args.captureId, state: 'completed' },
+              }),
+              {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              },
+            );
+          }
+          throw new Error(`unexpected url ${url}`);
+        });
+      return { receiptUrl, lifeCalls, telegramCalls, fetchSpy };
+    }
+
+    async function connectOwnerVoiceChannel() {
+      const opts = makeOpts();
+      (opts.registeredGroups as ReturnType<typeof vi.fn>).mockReturnValue({
+        'tg:111': { folder: 'ceo' } as any,
+      });
+      const ch = new TelegramChannel('token123', opts);
+      await ch.connect();
+      const handler = getVoiceHandler(lastBotInstance);
+      expect(handler).toBeDefined();
+      return { opts, handler };
+    }
+
+    function makeOwnerVoiceCtx(overrides: any = {}) {
+      return {
+        ...makeVoiceCtx(),
+        chat: { id: 111, type: 'private' },
+        from: { id: 111, first_name: 'Ceo' },
+        ...overrides,
+      };
+    }
+
+    function setVoiceLifeEnv() {
+      process.env.LIFE_API_URL = 'https://life.example.com';
+      process.env.LIFE_JOURNAL_ID = '42';
+      process.env.LIFE_API_TOKEN = 'test-token-abc';
+    }
+
+    async function spyDownloadFailureLogs() {
+      const { logger } = await import('../logger.js');
+      return vi.spyOn(logger, 'error').mockImplementation((() => {}) as never);
+    }
+
+    it('recovers an eligible owner download after a first fetch rejection with byte-identical audio', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const captureId = 'f1111111-1111-4111-8111-111111111111';
+      const audioText = 'retry-after-fetch-rejection-audio';
+      const { receiptUrl, lifeCalls, telegramCalls, fetchSpy } =
+        mockVoiceDownloadFetch({
+          captureId,
+          telegram: (attempt) => {
+            if (attempt === 1) throw new Error('socket hang up');
+            return telegramOkResponse(audioText);
+          },
+        });
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      await handler(makeOwnerVoiceCtx());
+
+      expect(telegramCalls).toHaveLength(2);
+      expect(telegramCalls[0]).toBe(telegramCalls[1]);
+      expect(telegramCalls[0]).toContain('https://api.telegram.org/file/bot');
+      expect(lifeCalls).toHaveLength(3);
+      expect(lifeCalls[0].url).toBe(receiptUrl);
+      expect(lifeCalls[1].url).toBe(`${receiptUrl}/${captureId}/process`);
+      expect(lifeCalls[2].url).toBe(`${receiptUrl}/${captureId}/complete`);
+      const form = lifeCalls[0].init?.body as FormData;
+      expect(form.get('sourceMessageKey')).toBe('telegram:111:222');
+      expect(form.get('durationSeconds')).toBe('12');
+      const audioPart = form.get('audio') as Blob;
+      expect(await audioPart.text()).toBe(audioText);
+      expect(forwardVoiceCapture).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('recovers an eligible owner download after a first HTTP 5xx with byte-identical audio', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const captureId = 'f2222222-2222-4222-8222-222222222222';
+      const audioText = 'retry-after-503-audio';
+      const { receiptUrl, lifeCalls, telegramCalls, fetchSpy } =
+        mockVoiceDownloadFetch({
+          captureId,
+          telegram: (attempt) =>
+            attempt === 1
+              ? telegramErrorResponse(503)
+              : telegramOkResponse(audioText),
+        });
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      await handler(makeOwnerVoiceCtx());
+
+      expect(telegramCalls).toHaveLength(2);
+      expect(telegramCalls[0]).toBe(telegramCalls[1]);
+      expect(lifeCalls).toHaveLength(3);
+      expect(lifeCalls[0].url).toBe(receiptUrl);
+      expect(lifeCalls[1].url).toBe(`${receiptUrl}/${captureId}/process`);
+      expect(lifeCalls[2].url).toBe(`${receiptUrl}/${captureId}/complete`);
+      const form = lifeCalls[0].init?.body as FormData;
+      expect(form.get('sourceMessageKey')).toBe('telegram:111:222');
+      expect(form.get('durationSeconds')).toBe('12');
+      const audioPart = form.get('audio') as Blob;
+      expect(await audioPart.text()).toBe(audioText);
+      expect(forwardVoiceCapture).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('recovers an eligible owner download after a first body-read rejection with byte-identical audio', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const captureId = 'f3333333-3333-4333-8333-333333333333';
+      const audioText = 'retry-after-body-read-audio';
+      const { receiptUrl, lifeCalls, telegramCalls, fetchSpy } =
+        mockVoiceDownloadFetch({
+          captureId,
+          telegram: (attempt) => {
+            if (attempt === 1) {
+              return {
+                ok: true,
+                status: 200,
+                arrayBuffer: async () => {
+                  throw new Error('body stream interrupted');
+                },
+              } as Response;
+            }
+            return telegramOkResponse(audioText);
+          },
+        });
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      await handler(makeOwnerVoiceCtx());
+
+      expect(telegramCalls).toHaveLength(2);
+      expect(telegramCalls[0]).toBe(telegramCalls[1]);
+      expect(lifeCalls).toHaveLength(3);
+      expect(lifeCalls[0].url).toBe(receiptUrl);
+      expect(lifeCalls[1].url).toBe(`${receiptUrl}/${captureId}/process`);
+      expect(lifeCalls[2].url).toBe(`${receiptUrl}/${captureId}/complete`);
+      const form = lifeCalls[0].init?.body as FormData;
+      expect(form.get('sourceMessageKey')).toBe('telegram:111:222');
+      expect(form.get('durationSeconds')).toBe('12');
+      const audioPart = form.get('audio') as Blob;
+      expect(await audioPart.text()).toBe(audioText);
+      expect(forwardVoiceCapture).toHaveBeenCalledTimes(1);
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('ends an eligible owner download on a first non-5xx failure without a Life request', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const errorSpy = await spyDownloadFailureLogs();
+      const { lifeCalls, telegramCalls, fetchSpy } = mockVoiceDownloadFetch({
+        captureId: 'f4444444-4444-4444-8444-444444444444',
+        telegram: () => telegramErrorResponse(404),
+      });
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      const ctx = makeOwnerVoiceCtx({
+        reply: vi.fn().mockResolvedValue(undefined),
+      });
+      await handler(ctx);
+
+      expect(telegramCalls).toHaveLength(1);
+      expect(lifeCalls).toHaveLength(0);
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const loggedObj = errorSpy.mock.calls[0][0] as Record<string, unknown>;
+      expect(loggedObj).toMatchObject({
+        chatId: '111',
+        messageId: '222',
+        code: 'http_error',
+        status: 404,
+      });
+      const loggedText = JSON.stringify(errorSpy.mock.calls);
+      expect(loggedText).not.toContain('token123');
+      expect(loggedText).not.toContain('api.telegram.org');
+      expect(loggedText).not.toContain('voice/file_123.ogg');
+
+      errorSpy.mockRestore();
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('makes a single file GET without retry for ineligible updates', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const errorSpy = await spyDownloadFailureLogs();
+
+      async function runIneligibleCase(ctxOverrides: any) {
+        const { lifeCalls, telegramCalls, fetchSpy } = mockVoiceDownloadFetch(
+          {
+            captureId: 'f5555555-5555-4555-8555-555555555555',
+            telegram: () => {
+              throw new Error('socket hang up');
+            },
+          },
+        );
+        const { opts, handler } = await connectOwnerVoiceChannel();
+        const ctx = {
+          ...makeOwnerVoiceCtx(),
+          ...ctxOverrides,
+          reply: vi.fn().mockResolvedValue(undefined),
+        };
+        await handler(ctx);
+        const result = {
+          telegramGets: telegramCalls.length,
+          lifeRequests: lifeCalls.length,
+          replies: (ctx.reply as ReturnType<typeof vi.fn>).mock.calls.length,
+          stored: (opts.onMessage as ReturnType<typeof vi.fn>).mock.calls
+            .length,
+        };
+        fetchSpy.mockRestore();
+        return result;
+      }
+
+      expect(await runIneligibleCase({ chat: { id: 111, type: 'group' } })).toEqual({
+        telegramGets: 1,
+        lifeRequests: 0,
+        replies: 0,
+        stored: 1,
+      });
+      expect(
+        await runIneligibleCase({ from: { id: 999, first_name: 'Other' } }),
+      ).toEqual({
+        telegramGets: 1,
+        lifeRequests: 0,
+        replies: 0,
+        stored: 1,
+      });
+
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      for (const call of errorSpy.mock.calls) {
+        const loggedObj = call[0] as Record<string, unknown>;
+        expect(loggedObj).toMatchObject({
+          chatId: '111',
+          messageId: '222',
+          code: 'fetch_failed',
+        });
+        expect(loggedObj).not.toHaveProperty('status');
+      }
+      const loggedText = JSON.stringify(errorSpy.mock.calls);
+      expect(loggedText).not.toContain('token123');
+      expect(loggedText).not.toContain('api.telegram.org');
+      expect(loggedText).not.toContain('voice/file_123.ogg');
+      expect(loggedText).not.toContain('socket hang up');
+
+      errorSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('sends no Life request or status when the retried owner download is exhausted', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const errorSpy = await spyDownloadFailureLogs();
+      const { lifeCalls, telegramCalls, fetchSpy } = mockVoiceDownloadFetch({
+        captureId: 'f6666666-6666-4666-8666-666666666666',
+        telegram: (attempt) => {
+          if (attempt === 1) throw new Error('socket hang up');
+          return telegramErrorResponse(503);
+        },
+      });
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      const ctx = makeOwnerVoiceCtx({
+        reply: vi.fn().mockResolvedValue(undefined),
+      });
+      await handler(ctx);
+
+      expect(telegramCalls).toHaveLength(2);
+      expect(telegramCalls[0]).toBe(telegramCalls[1]);
+      expect(lifeCalls).toHaveLength(0);
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(ctx.reply).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      const loggedObj = errorSpy.mock.calls[0][0] as Record<string, unknown>;
+      expect(loggedObj).toMatchObject({
+        chatId: '111',
+        messageId: '222',
+        code: 'http_error',
+        status: 503,
+      });
+      const loggedText = JSON.stringify(errorSpy.mock.calls);
+      expect(loggedText).not.toContain('token123');
+      expect(loggedText).not.toContain('api.telegram.org');
+      expect(loggedText).not.toContain('voice/file_123.ogg');
+      expect(loggedText).not.toContain('socket hang up');
+
+      errorSpy.mockRestore();
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
+
+    it('applies the byte-size check to a retried owner download', async () => {
+      setVoiceLifeEnv();
+      const { forwardVoiceCapture } = await useRealVoiceForwarder();
+      const oversized = new Uint8Array(26 * 1024 * 1024);
+      const { lifeCalls, telegramCalls, fetchSpy } = mockVoiceDownloadFetch({
+        captureId: 'f7777777-7777-4777-8777-777777777777',
+        telegram: (attempt) => {
+          if (attempt === 1) throw new Error('socket hang up');
+          return {
+            ok: true,
+            status: 200,
+            arrayBuffer: async () => oversized.buffer as ArrayBuffer,
+          } as Response;
+        },
+      });
+
+      const { opts, handler } = await connectOwnerVoiceChannel();
+      await handler(makeOwnerVoiceCtx());
+
+      expect(telegramCalls).toHaveLength(2);
+      expect(lifeCalls).toHaveLength(0);
+      expect(forwardVoiceCapture).not.toHaveBeenCalled();
+      expect(opts.onMessage).toHaveBeenCalledTimes(1);
+
+      fetchSpy.mockRestore();
+      clearLifeEnv();
+    });
   });
 
   describe('/life text capture command', () => {
