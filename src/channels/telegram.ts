@@ -1644,10 +1644,16 @@ export class TelegramChannel implements Channel {
       }
       return true;
     }
-    let file: { file_path?: string; file_size?: number };
-    try {
-      file = await ctx.api.getFile(fileId);
-    } catch {
+    let file: { file_path?: string; file_size?: number } | undefined;
+    for (let lookupAttempt = 1; lookupAttempt <= 2; lookupAttempt += 1) {
+      try {
+        file = await ctx.api.getFile(fileId);
+        break;
+      } catch (err) {
+        if (!isTransientVoiceLookupError(err) || lookupAttempt >= 2) break;
+      }
+    }
+    if (file === undefined) {
       logger.error(
         { code: 'life_prompt_voice_getfile_failed' },
         'Life prompt voice reply failed',
@@ -1687,26 +1693,24 @@ export class TelegramChannel implements Channel {
       }
       return true;
     }
-    let audioBytes: Buffer;
-    try {
-      const downloadRes = await fetch(
-        buildTelegramFileUrl(this.botToken, filePath),
-      );
-      if (!downloadRes.ok) {
-        logger.error(
-          { code: 'life_prompt_voice_download_failed' },
-          'Life prompt voice reply failed',
+    let audioBytes: Buffer | undefined;
+    for (let downloadAttempt = 1; downloadAttempt <= 2; downloadAttempt += 1) {
+      try {
+        const downloadRes = await fetch(
+          buildTelegramFileUrl(this.botToken, filePath),
         );
-        try {
-          await ctx.reply?.('Life voice capture failed.');
-        } catch {
-          // Reply failures stay contained.
+        if (!downloadRes.ok) {
+          if (downloadRes.status < 500 || downloadRes.status > 599) break;
+          continue;
         }
-        return true;
+        const downloaded = await downloadRes.arrayBuffer();
+        audioBytes = Buffer.from(downloaded);
+        break;
+      } catch {
+        // Network and body read failures retry once before giving up.
       }
-      const downloaded = await downloadRes.arrayBuffer();
-      audioBytes = Buffer.from(downloaded);
-    } catch {
+    }
+    if (audioBytes === undefined) {
       logger.error(
         { code: 'life_prompt_voice_download_failed' },
         'Life prompt voice reply failed',
@@ -1746,6 +1750,9 @@ export class TelegramChannel implements Channel {
         sourceMessageKey,
         promptInstanceId,
         durationSeconds,
+        retryReceiptOnFetchFailure: true,
+        retryCompletionOnTransientFailure: true,
+        retryProcessOnRetryableStructuringFailure: true,
       });
     } catch {
       logger.error(

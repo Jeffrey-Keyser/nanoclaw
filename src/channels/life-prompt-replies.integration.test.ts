@@ -896,6 +896,177 @@ describe('life prompt voice reply forwarding (production path)', () => {
     await ch.disconnect();
   });
 
+  function mockFlakyTelegramDownload(firstAttempt: () => Promise<Response>) {
+    let telegramAttempts = 0;
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any, init?: any) => {
+      const url = String(input);
+      if (url.includes('api.telegram.org')) {
+        telegramAttempts += 1;
+        if (telegramAttempts === 1) return firstAttempt();
+        return {
+          ok: true,
+          status: 200,
+          arrayBuffer: async () =>
+            new TextEncoder().encode(VOICE_AUDIO).buffer as ArrayBuffer,
+        } as Response;
+      }
+      return lifeCompleted(CAP_VOICE)(url, init);
+    });
+    return { fetchSpy, telegramAttempts: () => telegramAttempts };
+  }
+
+  it('retries a transient getFile failure once before completing the prompt reply', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-lookup-retry',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 751,
+      sourceMessageKey: 'telegram:111:751',
+    });
+    const fetchSpy = mockVoiceTransport(lifeCompleted(CAP_VOICE));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const { HttpError } = await import('grammy');
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 925,
+        date: Date.now() / 1000,
+        voice: { file_id: 'file-voice-1', file_size: 1000, duration: 7, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 751 },
+      },
+    });
+    ctx.api.getFile = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new HttpError("Network request for 'getFile' failed!", new Error('socket hang up')),
+      )
+      .mockResolvedValueOnce({ file_path: 'voice/prompt_751.ogg' });
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    expect(ctx.api.getFile).toHaveBeenCalledTimes(2);
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls).toHaveLength(3);
+    expect((lifeCalls[0].init?.body as FormData).get('promptInstanceId')).toBe(
+      'prompt-voice-lookup-retry',
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('retries a 5xx voice download once before completing the prompt reply', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-download-5xx',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 752,
+      sourceMessageKey: 'telegram:111:752',
+    });
+    const flaky = mockFlakyTelegramDownload(async () => ({ ok: false, status: 503 }) as Response);
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 926,
+        date: Date.now() / 1000,
+        voice: { file_id: 'file-voice-1', file_size: 1000, duration: 7, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 752 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    expect(flaky.telegramAttempts()).toBe(2);
+    const lifeCalls = lifeCallsForReceipt(flaky.fetchSpy);
+    expect(lifeCalls).toHaveLength(3);
+    expect(await ((lifeCalls[0].init?.body as FormData).get('audio') as Blob).text()).toBe(
+      VOICE_AUDIO,
+    );
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('retries a network-level voice download failure once before completing the prompt reply', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-download-net',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 753,
+      sourceMessageKey: 'telegram:111:753',
+    });
+    const flaky = mockFlakyTelegramDownload(() => Promise.reject(new TypeError('fetch failed')));
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 927,
+        date: Date.now() / 1000,
+        voice: { file_id: 'file-voice-1', file_size: 1000, duration: 7, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 753 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    expect(flaky.telegramAttempts()).toBe(2);
+    expect(lifeCallsForReceipt(flaky.fetchSpy)).toHaveLength(3);
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
+  it('retries a transient receipt fetch failure with promptInstanceId before completing', async () => {
+    const scope = currentScope();
+    insertLifePromptDeliveryReceipt({
+      scope,
+      promptInstanceId: 'prompt-voice-receipt-retry',
+      partIndex: 0,
+      partCount: 1,
+      telegramMessageId: 754,
+      sourceMessageKey: 'telegram:111:754',
+    });
+    let receiptAttempts = 0;
+    const fetchSpy = mockVoiceTransport((url, init) => {
+      if (url === voiceReceiptUrl()) {
+        receiptAttempts += 1;
+        if (receiptAttempts === 1) throw new TypeError('fetch failed');
+      }
+      return lifeCompleted(CAP_VOICE)(url, init);
+    });
+    const opts = makeOpts();
+    const ch = new TelegramChannel('token123', opts);
+    await ch.connect();
+    const ctx = makeVoiceReplyCtx({
+      message: {
+        message_id: 928,
+        date: Date.now() / 1000,
+        voice: { file_id: 'file-voice-1', file_size: 1000, duration: 7, mime_type: 'audio/ogg' },
+        reply_to_message: { message_id: 754 },
+      },
+    });
+    await getVoiceHandler(lastBotInstance)(ctx);
+
+    expect(receiptAttempts).toBe(2);
+    const lifeCalls = lifeCallsForReceipt(fetchSpy);
+    expect(lifeCalls).toHaveLength(4);
+    for (const call of lifeCalls.slice(0, 2)) {
+      const form = call.init?.body as FormData;
+      expect(form.get('promptInstanceId')).toBe('prompt-voice-receipt-retry');
+      expect(form.get('sourceMessageKey')).toBe('telegram:111:928');
+    }
+    expect(ctx.reply).toHaveBeenCalledWith(expect.stringContaining('Saved'));
+    expect(opts.onMessage).not.toHaveBeenCalled();
+    await ch.disconnect();
+  });
+
   it('leaves foreign-scope voice replies to the unassociated path without prompt metadata', async () => {
     const scope = currentScope();
     insertLifePromptDeliveryReceipt({
